@@ -77,19 +77,19 @@ print(f"所有结果: {results}")
 #### 3. 同步代码参与异步调度
 
 ```python
-from simple_asyncio import run, sleep, yield_control, get_event_loop
+from simple_asyncio import run, sleep, yield_control, get_event_loop,gather
 
 def cpu_heavy_task(task_id):
     """同步 CPU 密集型任务，通过 yield_control() 让出控制权"""
     for step in range(5):
         # 模拟计算
         result = sum(i * i for i in range(10000))
-        print(f"[Task {task_id}] 步骤 {step + 1}/5")
+        print(f"[Task {task_id}] 步骤 {step + 1}/5, 计算结果: {result}")
         
         # ⚠️ 关键：让出控制权给其他任务
         yield yield_control()
     
-    return f"Task {task_id} 完成"
+    return f"Task {task_id} 完成,"
 
 async def io_task(name):
     """异步 I/O 任务"""
@@ -104,7 +104,7 @@ loop = get_event_loop()
 sync_task = loop.create_task(cpu_heavy_task(1))
 async_task = loop.create_task(io_task("IO"))
 
-results = run(loop.gather(sync_task, async_task))
+results = run(gather(sync_task, async_task))
 print(f"结果: {results}")
 ```
 
@@ -121,13 +121,12 @@ print(f"结果: {results}")
 - 提供线程安全的回调调度
 
 ```python
-from simple_asyncio import EventLoop, get_running_loop
+from simple_asyncio import get_event_loop,sleep
 
-loop = EventLoop()
+loop = get_event_loop()
 
 # 创建任务
 async def my_coro():
-    loop = get_running_loop()  # 获取当前事件循环
     await sleep(1)
     return "done"
 
@@ -163,7 +162,7 @@ print(future.cancel_msg())  # "用户取消"
 **Task**: 包装协程/生成器，驱动其一步步执行。
 
 ```python
-from simple_asyncio import Task, get_event_loop
+from simple_asyncio import Task, get_event_loop,sleep
 
 async def my_coro():
     await sleep(1)
@@ -184,50 +183,62 @@ print(task.cancelled())  # True
 ### 3. TimerHandle - 定时器管理
 
 ```python
-from simple_asyncio import get_event_loop, sleep
+from simple_asyncio import sleep, get_running_loop, run
 
-loop = get_event_loop()
 
-def callback(value):
-    print(f"定时器触发: {value}")
+async def main():
+    loop = get_running_loop()
 
-# 创建定时器（0.5 秒后执行）
-handle = loop.call_later(0.5, callback, "hello")
+    def callback(value):
+        print(f"定时器触发: {value}")
 
-# 取消定时器
-handle.cancel()
+    # 创建定时器（0.5 秒后执行）
+    handle = loop.call_later(0.5, callback, "hello")
 
-await sleep(1)  # 等待观察
+    # 取消定时器
+    handle.cancel()
+
+    await sleep(1)  # 等待观察
+
+
+run(main())
 ```
 
 ### 4. 线程安全调度
 
 ```python
-from simple_asyncio import get_event_loop, sleep
 import threading
 
-loop = get_event_loop()
+from simple_asyncio import get_running_loop, sleep, run
 
-def thread_func():
-    """从其他线程向事件循环提交回调"""
-    print("[Thread] 提交回调...")
-    loop.call_soon_threadsafe(lambda: print("[EventLoop] 回调执行"))
 
-# 启动线程
-thread = threading.Thread(target=thread_func)
-thread.start()
-thread.join()
+async def main():
+    loop = get_running_loop()
 
-await sleep(0.1)  # 等待回调执行
+    def thread_func():
+        """从其他线程向事件循环提交回调"""
+        print("[Thread] 提交回调...")
+        loop.call_soon_threadsafe(lambda: print("[EventLoop] 回调执行"))
+
+    # 启动线程
+    thread = threading.Thread(target=thread_func)
+    thread.start()
+    thread.join()
+
+    await sleep(0.1)  # 等待回调执行
+
+
+run(main())
 ```
 
 ### 5. 异步 Socket
 
 ```python
 from simple_asyncio import AsyncSocket, run
+import socket
 
 async def tcp_client():
-    sock = AsyncSocket(socket.AF_INET, socket.SOCK_STREAM)
+    sock = AsyncSocket(socket.socket())
     await sock.connect(('127.0.0.1', 8080))
     
     await sock.send(b"Hello Server")
@@ -270,7 +281,7 @@ assert id(loop1) != id(loop2)  # 不同的循环实例
 ### 任务取消与传播
 
 ```python
-from simple_asyncio import run, sleep, CancelledError
+from simple_asyncio import run, sleep, CancelledError,get_running_loop
 
 async def long_task():
     try:
@@ -285,7 +296,7 @@ task = None
 
 async def main():
     global task
-    task = get_event_loop().create_task(long_task())
+    task = get_running_loop().create_task(long_task())
     
     await sleep(0.5)
     task.cancel(msg="超时取消")
@@ -426,6 +437,7 @@ python test/test_eventloop_run_contextvar.py
 
 1. **添加新的异步原语**
    ```python
+   from simple_asyncio import Future, get_running_loop, sleep
    def my_new_primitive(arg):
        loop = get_running_loop()
        future = loop.create_future()
@@ -445,10 +457,11 @@ python test/test_eventloop_run_contextvar.py
    ```python
    # test/test_my_feature.py
    from simple_asyncio import run
-   
+   def my_async_func():
+        yield "expected"
    def test_my_feature():
        result = run(my_async_func())
-       assert result == expected
+       assert result == "expected"
    ```
 
 ---
@@ -460,6 +473,8 @@ python test/test_eventloop_run_contextvar.py
 **A**: 允许同步生成器参与异步调度，实现协作式多任务。适用于 CPU 密集型任务需要定期让出控制权的场景。
 
 ```python
+from simple_asyncio import yield_control
+
 def cpu_task():
     for i in range(1000000):
         # 计算...
