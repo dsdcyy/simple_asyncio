@@ -1,9 +1,23 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
-# @Author : Ljw
-# @Time : 2026/5/4 18:15
-# @FileName  :simple_asyncio.py
+"""
+微型异步事件循环框架实现
 
+提供了一个简化版的 asyncio 实现，包含：
+- 事件循环（EventLoop）
+- Future/Task 系统
+- 定时器管理（TimerHandle）
+- I/O 多路复用（基于 selectors）
+- 线程安全调度（call_soon_threadsafe）
+- 异步原语（sleep, gather, wait, wait_for）
+- 异步 Socket 封装（AsyncSocket）
+
+支持生成器协程和原生协程（async/await）。
+
+Author: Ljw(dsdcyy)
+Created: 2026/5/4
+"""
+import contextvars
 import errno
 import heapq
 import os
@@ -13,83 +27,176 @@ import threading
 import time
 import weakref
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, Future as ThreadFuture
 from types import GeneratorType, CoroutineType
-from typing import Generator, Awaitable, Any
+from typing import (
+    Generator,
+    Awaitable,
+    Any,
+    Callable,
+    Optional,
+    Tuple,
+    Set,
+    List,
+    Union,
+)
+from contextvars import ContextVar
 
-current_loop: "EventLoop|None" = None
+# 使用 ContextVar 存储当前事件循环（线程安全、协程安全）
+_loop_var: ContextVar[Optional["EventLoop"]] = ContextVar("_loop", default=None)
 
 FIRST_COMPLETED = "FIRST_COMPLETED"
 FIRST_EXCEPTION = "FIRST_EXCEPTION"
 ALL_COMPLETED = "ALL_COMPLETED"
 
 
-def get_running_loop():
-    if current_loop is None:
+def get_running_loop() -> "EventLoop":
+    """
+    获取当前正在运行的事件循环
+
+    Returns:
+        EventLoop: 当前运行的事件循环实例
+
+    Raises:
+        RuntimeError: 如果没有正在运行的事件循环
+    """
+    loop = _loop_var.get()
+    if loop is None:
         raise RuntimeError("No running event loop")
-    return current_loop
+    return loop
 
 
-def get_event_loop():
-    global current_loop
-    if current_loop is None:
-        current_loop = EventLoop()
-    return current_loop
+def get_event_loop() -> "EventLoop":
+    """
+    获取或创建事件循环
+
+    Returns:
+        EventLoop: 事件循环实例（如果不存在则创建新的）
+
+    Note:
+        此函数会复用已存在的事件循环。
+        如果需要新的事件循环，请直接创建 EventLoop() 实例。
+    """
+    loop = _loop_var.get()
+    if loop is None:
+        loop = EventLoop()
+        _loop_var.set(loop)
+    return loop
 
 
 class CancelledError(Exception):
+    """任务或 Future 被取消时抛出的异常"""
+
     pass
 
 
 class TimeoutError(Exception):
+    """操作超时时抛出的异常"""
+
     pass
 
 
 class YieldControl:
-    """用于同步生成器让出控制权的标记对象"""
-    _instance = None
-
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
-
-
-def yield_control():
     """
-    在同步生成器中调用，让出控制权给其他任务
-    
+    用于同步生成器让出控制权的标记对象（单例）
+
     用法:
         def sync_task():
             # 做一些工作
             yield yield_control()  # 让出控制权
             # 继续工作
     """
+
+    _instance = None
+
+    def __new__(cls) -> "YieldControl":
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+
+def yield_control() -> YieldControl:
+    """
+    在同步生成器中调用，让出控制权给其他任务
+
+    Returns:
+        YieldControl: 单例标记对象
+
+    Example:
+        >>> def cpu_heavy_task():
+        ...     for i in range(100):
+        ...         result = sum(j * j for j in range(1000))
+        ...         yield yield_control()  # 让出控制权
+        ...     return result
+    """
     return YieldControl()
 
 
 class Future:
+    """
+    异步操作的结果占位符
+
+    Future 代表一个尚未完成的异步操作的结果。
+    可以设置结果、异常，或取消操作。
+
+    Attributes:
+        _result: 操作结果
+        _exception: 操作异常
+        _done: 是否已完成
+        _cancelled: 是否被取消
+        _cancel_msg: 取消消息
+        _callbacks: 完成回调列表
+        _loop: 关联的事件循环
+    """
+
     __slots__ = (
-        '_result', '_exception', '_done', '_cancelled',
-        '_cancel_msg', '_callbacks', '_loop'
+        "_result",
+        "_exception",
+        "_done",
+        "_cancelled",
+        "_cancel_msg",
+        "_callbacks",
+        "_loop",
     )
 
-    def __init__(self, loop=None):
+    def __init__(self, loop: Optional["EventLoop"] = None) -> None:
+        """
+        初始化 Future
+
+        Args:
+            loop: 关联的事件循环（默认为当前运行的循环）
+        """
         self._result = None
         self._exception = None
         self._done = False
         self._cancelled = False
         self._cancel_msg = None
-        self._callbacks = []
+        self._callbacks: List[Callable[["Future"], Any]] = []
         self._loop = loop or get_running_loop()
 
-    def _check_done(self, check_true=True):
+    def _check_done(self, check_true: bool = True) -> None:
+        """
+        检查 Future 的完成状态
+
+        Args:
+            check_true: 如果为 True，检查是否已完成；否则检查是否未完成
+
+        Raises:
+            RuntimeError: 状态不符合预期
+        """
         if self._done is check_true:
             if check_true:
                 raise RuntimeError("Future already done")
             raise RuntimeError("Future is not done")
 
-    def _finish(self, result=None, exc=None):
+    def _finish(self, result: Any = None, exc: Optional[Exception] = None) -> None:
+        """
+        完成 Future，设置结果或异常，并触发回调
+
+        Args:
+            result: 操作结果
+            exc: 操作异常
+        """
         self._check_done()
         self._result = result
         self._exception = exc
@@ -99,48 +206,107 @@ class Future:
         for cb in callbacks:
             self._loop.call_soon(cb, self)
 
-    def set_result(self, result):
+    def set_result(self, result: Any) -> None:
+        """
+        设置 Future 的结果
+
+        Args:
+            result: 操作结果
+
+        Raises:
+            RuntimeError: 如果 Future 已经完成
+        """
         self._finish(result)
 
-    def set_exception(self, exc):
+    def set_exception(self, exc: Exception) -> None:
+        """
+        设置 Future 的异常
+
+        Args:
+            exc: 异常对象
+
+        Raises:
+            RuntimeError: 如果 Future 已经完成
+        """
         self._finish(exc=exc)
 
-    def add_done_callback(self, cb):
+    def add_done_callback(self, cb: Callable[["Future"], Any]) -> None:
+        """
+        添加完成回调
+
+        Args:
+            cb: 回调函数，接收 Future 作为参数
+        """
         if self._done:
             self._loop.call_soon(cb, self)
         else:
             self._callbacks.append(cb)
 
-    def done(self):
+    def done(self) -> bool:
+        """
+        检查 Future 是否已完成
+
+        Returns:
+            bool: 如果已完成返回 True
+        """
         return self._done
 
-    def exception(self):
+    def exception(self) -> Optional[Exception]:
+        """
+        获取 Future 的异常
+
+        Returns:
+            Exception or None: 异常对象，如果没有异常则为 None
+
+        Raises:
+            RuntimeError: 如果 Future 还未完成
+        """
         self._check_done(False)
         return self._exception
 
-    def result(self):
+    def result(self) -> Any:
+        """
+        获取 Future 的结果
+
+        Returns:
+            Any: 操作结果
+
+        Raises:
+            RuntimeError: 如果 Future 还未完成
+            Exception: 如果 Future 有异常，则抛出该异常
+        """
         self._check_done(False)
         if self._exception is not None:
             raise self._exception
         return self._result
 
-    def __iter__(self):
-        """让 future 可被 yield，生成器通过 yield future 来等待"""
+    def __iter__(self) -> Generator["Future", Any, Any]:
+        """
+        让 Future 可被 yield，生成器通过 yield future 来等待
+
+        Returns:
+            Generator: 生成器对象
+        """
         result = yield self
         return result
 
-    def __await__(self):
-        """让 future 可被 await，支持原生协程"""
+    def __await__(self) -> Generator["Future", Any, Any]:
+        """
+        让 Future 可被 await，支持原生协程
+
+        Returns:
+            Generator: 生成器对象
+        """
         # __await__ 必须返回一个迭代器
         return self.__iter__()
 
-    def cancel(self, msg=None):
+    def cancel(self, msg: Optional[str] = None) -> bool:
         """
         取消 Future
-        
+
         Args:
             msg: 取消原因消息（可选）
-        
+
         Returns:
             bool: 是否成功取消
         """
@@ -152,34 +318,83 @@ class Future:
         self._finish(exc=CancelledError(msg))
         return True
 
-    def cancelled(self):
-        """检查 Future 是否被取消"""
+    def cancelled(self) -> bool:
+        """
+        检查 Future 是否被取消
+
+        Returns:
+            bool: 如果被取消返回 True
+        """
         return self._cancelled
 
-    def cancel_msg(self):
-        """获取取消时的消息"""
+    def cancel_msg(self) -> Optional[str]:
+        """
+        获取取消时的消息
+
+        Returns:
+            str or None: 取消消息
+        """
         return self._cancel_msg
 
 
 class Task(Future):
-    """把一个生成器包装成 Future，驱动它一步步执行"""
+    """
+    异步任务，将生成器或协程包装成 Future
+
+    Task 继承自 Future，负责驱动生成器/协程一步步执行。
+    它管理任务的调度、取消和完成状态。
+
+    Attributes:
+        gen: 被包装的生成器或协程对象
+        name: 任务名称（用于调试和日志）
+        _next_value: 下一次发送给生成器的值
+        _stepping: 是否正在执行 _step（防止重入）
+        _rescheduled: 是否已重新调度（处理重入情况）
+        _waiting: 当前等待的 Future 对象
+    """
+
     __slots__ = (
-        'gen', 'name', '_next_value', '_stepping',
-        '_rescheduled', '_waiting'
+        "gen",
+        "name",
+        "_next_value",
+        "_stepping",
+        "_rescheduled",
+        "_waiting",
+        "_context",
     )
 
-    def __init__(self, gen: Awaitable | Generator, loop=None, name=None):
+    def __init__(
+        self,
+        gen: Union[Awaitable[Any], Generator[Any, Any, Any]],
+        loop: Optional["EventLoop"] = None,
+        name: Optional[str] = None,
+    ) -> None:
+        """
+        初始化 Task
+
+        Args:
+            gen: 生成器或协程对象
+            loop: 关联的事件循环（默认为当前运行的循环）
+            name: 任务名称（可选，未提供则自动生成）
+        """
         super().__init__(loop)
         self.gen = gen
         self.name = name or f"Task-{id(self)}"  # 任务名称
         # 启动生成器，并处理它遇到的第一个 yield
         self._loop.call_soon(self._step)
-        self._next_value = None
+        self._next_value: Any = None
         self._stepping = False
         self._rescheduled = False
-        self._waiting = None  # 当前等待的 Future
+        self._waiting: Optional[Future] = None  # 当前等待的 Future
+        self._context = contextvars.copy_context()
 
-    def _on_done(self, f):
+    def _on_done(self, f: Future) -> None:
+        """
+        当等待的 Future 完成时的回调
+
+        Args:
+            f: 已完成的 Future 对象
+        """
         if self._done:
             return
         if self._waiting is not f:
@@ -197,19 +412,32 @@ class Task(Future):
             self._next_value = res
             self._loop.call_soon(self._step)
 
-    def cancelled(self):
-        """检查 Task 是否被取消（基于异常类型判断）"""
+    def cancelled(self) -> bool:
+        """
+        检查 Task 是否被取消（基于异常类型判断）
+
+        Returns:
+            bool: 如果任务被取消返回 True
+
+        Note:
+            与 Future.cancelled() 不同，这里基于异常类型判断，
+            因为 Task 在取消处理过程中会重置 _cancelled 标志。
+        """
         return self._done and isinstance(self._exception, CancelledError)
 
-    def cancel(self, msg=None):
+    def cancel(self, msg: Optional[str] = None) -> bool:
         """
-        取消任务8
-        
+        取消任务
+
         Args:
             msg: 取消原因消息（可选）
-        
+
         Returns:
             bool: 是否成功取消
+
+        Note:
+            取消时会传播到当前等待的 Future（如果有），
+            并调度 _step 以注入 CancelledError。
         """
         if self._done or self._cancelled:
             return False
@@ -224,7 +452,36 @@ class Task(Future):
         self._loop.call_soon(self._step)
         return True
 
-    def _step(self, value=None, is_exc=False):
+    def _step(self, value: Any = None, is_exc: bool = False) -> None:
+        """
+        在上下文运行 _real_step 方法
+        """
+        self._context.run(self._real_step, value, is_exc)
+
+    def _real_step(self, value: Any = None, is_exc: bool = False) -> None:
+        """
+        驱动生成器执行一步
+
+        这是 Task 的核心方法，负责：
+        1. 向生成器发送值或抛出异常
+        2. 处理生成器的 yield 结果
+        3. 管理任务的完成状态
+
+        Args:
+            value: 发送给生成器的值，或要抛出的异常
+            is_exc: 如果为 True，value 是异常对象，将抛出；否则作为值发送
+
+        Workflow:
+            1. 检查重入保护（_stepping）
+            2. 根据 is_exc 决定 send() 或 throw()
+            3. 处理 StopIteration（任务完成）
+            4. 处理其他异常（任务失败）
+            5. 处理 yield 的结果：
+               - Future: 等待完成后继续
+               - Generator/Coroutine: 包装成 Task 后等待
+               - YieldControl: 让出控制权
+               - 其他值: 作为下一次 send 的输入
+        """
         if self._done:
             return
 
@@ -240,7 +497,6 @@ class Task(Future):
         try:
             if is_exc:
                 yielded = self.gen.throw(value)
-
             elif self._cancelled:
                 self._cancelled = False
                 self._next_value = None  # 清掉 resume 值（关键！）
@@ -259,6 +515,7 @@ class Task(Future):
         finally:
             self._stepping = False
             self._rescheduled = False
+
         # 如果生成器 yield 了一个 Future，就等它完成后继续 _step
         if isinstance(yielded, Future):
             self._waiting = yielded
@@ -282,10 +539,38 @@ class Task(Future):
 
 
 class TimerHandle:
-    """代表一个已排期的定时器回调，可以取消"""
-    __slots__ = ('_callback', '_args', '_loop_ref', '_when', '_cancelled')
+    """
+    定时器句柄，代表一个已排期的延迟回调
 
-    def __init__(self, callback, args, loop, when):
+    TimerHandle 由 EventLoop.call_later() 创建，
+    允许用户取消尚未执行的定时器。
+
+    Attributes:
+        _callback: 到期时执行的回调函数
+        _args: 回调函数的参数
+        _loop_ref: 事件循环的弱引用（避免循环引用）
+        _when: 定时器的到期时间（单调时间）
+        _cancelled: 是否已被取消
+    """
+
+    __slots__ = ("_callback", "_args", "_loop_ref", "_when", "_cancelled")
+
+    def __init__(
+        self,
+        callback: Callable[..., Any],
+        args: Tuple[Any, ...],
+        loop: "EventLoop",
+        when: float,
+    ) -> None:
+        """
+        初始化定时器句柄
+
+        Args:
+            callback: 到期时执行的回调函数
+            args: 回调函数的参数元组
+            loop: 关联的事件循环
+            when: 到期时间（单调时间戳）
+        """
         self._callback = callback
         self._args = args
         self._loop_ref = weakref.ref(loop)  # 弱引用
@@ -293,40 +578,96 @@ class TimerHandle:
         self._when = when  # 记录到期时间，便于调试
         self._cancelled = False
 
-    def cancel(self):
-        """取消定时器，后续到期时其回调将不会执行"""
+    def cancel(self) -> None:
+        """
+        取消定时器
+
+        取消后，定时器到期时其回调将不会执行。
+        这是一个幂等操作，可以安全地多次调用。
+        """
         self._cancelled = True
 
-    def run(self):
-        """将回调排入就绪队列（与老行为一致）"""
+    def run(self) -> None:
+        """
+        执行定时器回调
+
+        如果定时器未被取消，则将回调排入事件循环的就绪队列。
+        此方法由事件循环在定时器到期时自动调用。
+        """
         if not self._cancelled:
             loop = self._loop_ref()
             if loop:
                 loop.call_soon(self._callback, *self._args)
 
-    def cancelled(self):
-        """检查定时器是否已被取消"""
+    def cancelled(self) -> bool:
+        """
+        检查定时器是否已被取消
+
+        Returns:
+            bool: 如果已取消返回 True
+        """
         return self._cancelled
 
-    def __repr__(self):
+    def __repr__(self) -> str:
+        """
+        返回定时器的字符串表示
+
+        Returns:
+            str: 格式为 <TimerHandle when=X.XXX status>
+        """
         status = "cancelled" if self._cancelled else "scheduled"
         return f"<TimerHandle when={self._when:.3f} {status}>"
 
-    def when(self):
-        """返回定时器的到期时间（单调时间）"""
+    def when(self) -> float:
+        """
+        返回定时器的到期时间
+
+        Returns:
+            float: 到期时间（单调时间戳）
+        """
         return self._when
 
 
 class EventLoop:
-    def __init__(self):
-        self._ready = deque()  # 就绪回调队列
-        self._scheduled = []  # 最小堆，存 (deadline, seq, callback, args)
+    """
+    异步事件循环核心实现
+
+    EventLoop 是整个异步框架的核心，负责：
+    - 调度和管理异步任务
+    - 处理 I/O 多路复用（基于 selectors）
+    - 管理定时器
+    - 提供线程安全的回调调度
+    - 执行异步原语（sleep, gather, wait 等）
+
+    Attributes:
+        _ready: 就绪回调队列（deque）
+        _scheduled: 定时器堆（最小堆）
+        _timer_seq: 定时器序列号（用于堆排序稳定性）
+        _running: 是否正在运行
+        _tasks: 所有活跃任务的集合
+        _selector: I/O 多路复用器
+        _exception_handler: 自定义异常处理器
+        _execute_pool: 线程池执行器
+        _ready_lock: 保护 _ready 的线程锁
+        _closed: 是否已关闭
+        _self_reader: 自唤醒管道读端
+        _self_writer: 自唤醒管道写端
+    """
+
+    def __init__(self) -> None:
+        """
+        初始化事件循环
+
+        创建必要的数据结构和自唤醒管道。
+        """
+        self._ready: deque = deque()  # 就绪回调队列
+        self._scheduled: list = []  # 最小堆，存 (deadline, seq, handler)
         self._timer_seq = 0
         self._running = False
-        self._tasks: set[Task] = set()
+        self._tasks: Set[Task] = set()
         self._selector = selectors.DefaultSelector()
-        self._exception_handler = None
-        self._execute_pool = None
+        self._exception_handler: Optional[Callable[["EventLoop", dict], None]] = None
+        self._execute_pool: Optional[ThreadPoolExecutor] = None
         self._ready_lock = threading.Lock()  # 保护 _ready 的线程锁
         self._closed = False  # 标记是否已关闭
 
@@ -337,15 +678,25 @@ class EventLoop:
 
         # 将读端注册到 selector，回调用于“消费”唤醒信号
         self._selector.register(
-            self._self_reader.fileno(),
-            selectors.EVENT_READ,
-            (self._consume_wake, ())
+            self._self_reader.fileno(), selectors.EVENT_READ, (self._consume_wake, ())
         )
 
-    def is_closed(self):
+    def is_closed(self) -> bool:
+        """
+        检查事件循环是否已关闭
+
+        Returns:
+            bool: 如果已关闭返回 True
+        """
         return self._closed
 
-    def close(self):
+    def close(self) -> None:
+        """
+        关闭事件循环，释放资源
+
+        清理自唤醒管道、selector 和线程池。
+        这是一个幂等操作，可以安全地多次调用。
+        """
         if self._closed:
             return  # 已经关闭，避免重复关闭
         self._closed = True
@@ -363,8 +714,13 @@ class EventLoop:
             self._execute_pool.shutdown(wait=False)
             self._execute_pool = None
 
-    def _consume_wake(self):
-        """读取自唤醒管道中的字节（消费信号）"""
+    def _consume_wake(self) -> None:
+        """
+        读取自唤醒管道中的字节（消费唤醒信号）
+
+        当其他线程调用 call_soon_threadsafe 时，
+        会向写端发送数据，触发此回调以打断 selector.select() 的阻塞。
+        """
         try:
             while True:
                 self._self_reader.recv(4096)
@@ -373,21 +729,59 @@ class EventLoop:
         except OSError:
             pass
 
-    def call_soon_threadsafe(self, callback, *args):
-        """线程安全版本的 call_soon，供其他线程调用"""
+    def call_soon_threadsafe(self, callback: Callable[..., Any], *args: Any) -> None:
+        """
+        线程安全版本的 call_soon，供其他线程调用
+
+        从其他线程向事件循环提交回调。使用锁保护 _ready 队列，
+        并通过自唤醒管道打断 selector.select() 的阻塞。
+
+        Args:
+            callback: 要执行的回调函数
+            *args: 回调函数的参数
+
+        Thread Safety:
+            此方法是线程安全的，可以从任何线程调用。
+        """
         with self._ready_lock:
             self._ready.append((callback, args))
         self._wake_loop()
 
-    def _wake_loop(self):
-        """向自唤醒管道写入一个字节，打断 selector.select"""
+    def _wake_loop(self) -> None:
+        """
+        向自唤醒管道写入一个字节，打断 selector.select()
+
+        当有其他线程通过 call_soon_threadsafe 添加回调时，
+        需要唤醒事件循环以立即处理新任务。
+        """
         try:
-            self._self_writer.send(b'\x00')
+            self._self_writer.send(b"\x00")
         except OSError:
             pass  # 写端已关闭等异常忽略
 
-    def run_in_thread_executor(self, func, *args, **kwargs):
-        """在线程池中异步执行函数，返回结果"""
+    def run_in_thread_executor(
+        self, func: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> Future:
+        """
+        在线程池中异步执行同步函数，返回 Future
+
+        将阻塞的同步函数放到线程池中执行，不阻塞事件循环。
+        支持取消：如果 Future 被取消，也会尝试取消线程任务。
+
+        Args:
+            func: 要执行的同步函数
+            *args: 位置参数
+            **kwargs: 关键字参数
+
+        Returns:
+            Future: 代表异步操作结果的 Future 对象
+
+        Example:
+            >>> def blocking_io():
+            ...     time.sleep(5)
+            ...     return "done"
+            >>> result = await loop.run_in_thread_executor(blocking_io)
+        """
         if self._execute_pool is None:
             self._execute_pool = ThreadPoolExecutor()
 
@@ -395,16 +789,16 @@ class EventLoop:
         f = self.create_future()
 
         # 支持取消：当 Future 被取消时，也取消线程任务
-        def cancel_thread_future(fut):
+        def cancel_thread_future(fut: Future):
             if fut.cancelled() and not tf.done():
                 tf.cancel()
 
         f.add_done_callback(cancel_thread_future)
 
-        def _on_thread_done():
+        def _on_thread_done(tfut: ThreadFuture):
             def set_result():
                 try:
-                    res = tf.result()
+                    res = tfut.result()
                 except Exception as e:
                     f.set_exception(e)
                 else:
@@ -412,17 +806,33 @@ class EventLoop:
 
             self.call_soon_threadsafe(set_result)
 
-        tf.add_done_callback(lambda _: _on_thread_done())
+        tf.add_done_callback(_on_thread_done)
         return f
 
-    def set_exception_handler(self, handler):
-        """设置自定义异常处理器，handler 支持可调用对象，传入 (loop, context)"""
+    def set_exception_handler(
+        self, handler: Optional[Callable[["EventLoop", dict], None]]
+    ) -> None:
+        """
+        设置自定义异常处理器
+
+        Args:
+            handler: 异常处理函数，接收 (loop, context) 参数。
+                    如果为 None，则使用默认处理器（打印到 stdout）。
+
+        Raises:
+            TypeError: 如果 handler 不是可调用对象或 None
+        """
         if handler is not None and not callable(handler):
             raise TypeError("handler must be callable or None")
         self._exception_handler = handler
 
-    def call_exception_handler(self, context):
-        """调用用户设置的自定义异常处理器，或默认打印"""
+    def call_exception_handler(self, context: dict) -> None:
+        """
+        调用异常处理器
+
+        Args:
+            context: 异常上下文字典，包含 'message', 'exception' 等键
+        """
         if self._exception_handler is not None:
             try:
                 self._exception_handler(self, context)
@@ -433,72 +843,161 @@ class EventLoop:
         else:
             # 默认行为：简单打印（可根据需要输出到 sys.stderr）
             print(f"[loop] Exception: {context.get('message')}")
-            exc = context.get('exception')
+            exc = context.get("exception")
             if exc:
                 import traceback
+
                 traceback.print_exception(type(exc), exc, exc.__traceback__)
 
-    def call_soon(self, callback, *args):
-        """立即安排回调"""
+    def call_soon(self, callback: Callable[..., Any], *args: Any) -> None:
+        """
+        立即安排回调执行
+
+        将回调添加到就绪队列，在下一个事件循环迭代中执行。
+
+        Args:
+            callback: 要执行的回调函数
+            *args: 回调函数的参数
+
+        Note:
+            此方法不是线程安全的。从其他线程调用应使用 call_soon_threadsafe。
+        """
         with self._ready_lock:
             self._ready.append((callback, args))
 
-    def call_later(self, delay, callback, *args):
-        """延迟 delay 秒后执行回调"""
+    def call_later(
+        self, delay: float, callback: Callable[..., Any], *args: Any
+    ) -> TimerHandle:
+        """
+        延迟执行回调
+
+        创建一个定时器，在 delay 秒后执行回调。
+
+        Args:
+            delay: 延迟时间（秒）
+            callback: 到期时执行的回调函数
+            *args: 回调函数的参数
+
+        Returns:
+            TimerHandle: 定时器句柄，可用于取消定时器
+
+        Example:
+            >>> handle = loop.call_later(1.0, print, "Hello")
+            >>> handle.cancel()  # 取消定时器
+        """
         deadline = time.monotonic() + delay
         self._timer_seq += 1
         handler = TimerHandle(callback, args, self, deadline)
         heapq.heappush(self._scheduled, (deadline, self._timer_seq, handler))
         return handler
 
-    def add_reader(self, fileobj, callback, *args):
+    def add_reader(
+        self, fileobj: int, callback: Callable[..., Any], *args: Any
+    ) -> None:
+        """
+        注册文件描述符的可读事件
+
+        Args:
+            fileobj: 文件描述符或 socket
+            callback: 可读时执行的回调
+            *args: 回调参数
+        """
         try:
             self._selector.unregister(fileobj)
         except KeyError:
             pass
         self._selector.register(fileobj, selectors.EVENT_READ, (callback, args))
 
-    def add_writer(self, fileobj, callback, *args):
+    def add_writer(
+        self, fileobj: int, callback: Callable[..., Any], *args: Any
+    ) -> None:
+        """
+        注册文件描述符的可写事件
+
+        Args:
+            fileobj: 文件描述符或 socket
+            callback: 可写时执行的回调
+            *args: 回调参数
+        """
         try:
             self._selector.unregister(fileobj)
         except KeyError:
             pass
         self._selector.register(fileobj, selectors.EVENT_WRITE, (callback, args))
 
-    def remove_reader(self, fileobj):
-        """移除文件描述符的可读事件"""
-        try:
-            self._selector.unregister(fileobj)
-        except KeyError:
-            pass  # 已经移除
-
-    def remove_writer(self, fileobj):
-        """移除文件描述符的可写事件"""
-        try:
-            self._selector.unregister(fileobj)
-        except KeyError:
-            pass  # 已经移除
-
-    def create_task(self, gen: Generator[Future, Any, Any] | Awaitable, name=None):
+    def remove_reader(self, fileobj: int) -> None:
         """
-        接收生成器 coroutine，返回 Task
-        
+        移除文件描述符的可读事件
+
         Args:
-            gen: 生成器或协程
-            name: 任务名称（可选）
+            fileobj: 文件描述符或 socket
+        """
+        try:
+            self._selector.unregister(fileobj)
+        except KeyError:
+            pass  # 已经移除
+
+    def remove_writer(self, fileobj: int) -> None:
+        """
+        移除文件描述符的可写事件
+
+        Args:
+            fileobj: 文件描述符或 socket
+        """
+        try:
+            self._selector.unregister(fileobj)
+        except KeyError:
+            pass  # 已经移除
+
+    def create_task(
+        self,
+        gen: Union[Generator[Future, Any, Any], Awaitable[Any]],
+        name: Optional[str] = None,
+    ) -> Task:
+        """
+        创建异步任务
+
+        将生成器或协程包装成 Task，并添加到事件循环的任务集合中。
+
+        Args:
+            gen: 生成器或协程对象
+            name: 任务名称（可选，用于调试和日志）
+
+        Returns:
+            Task: 创建的任务对象
+
+        Example:
+            >>> async def my_coro():
+            ...     await sleep(1)
+            ...     return "done"
+            >>> task = loop.create_task(my_coro(), name="MyTask")
         """
         task = Task(gen, self, name=name)
         self._tasks.add(task)
         task.add_done_callback(self._task_done)
         return task
 
-    def _task_done(self, task: Task):
+    def _task_done(self, task: Task) -> None:
+        """
+        任务完成时的回调
+
+        从任务集合中移除已完成的任务。
+
+        Args:
+            task: 已完成的任务
+        """
         self._tasks.discard(task)
 
-    def create_future(self):
+    def create_future(self) -> Future:
+        """
+        创建一个新的 Future 对象
+
+        Returns:
+            Future: 与当前事件循环关联的 Future 对象
+        """
         return Future(self)
 
-    def run(self, awaitable: Generator[Future, Any, Any] | Task | Future):
+    def run(self, awaitable: Union[Generator[Future, Any, Any], Task, Future]) -> Any:
         """
         直接运行一个 awaitable（生成器/Task/Future）并返回最终结果。
 
@@ -506,15 +1005,22 @@ class EventLoop:
             task = loop.create_task(coro_gen)
             loop.run_until_complete(task)
             return task.result()
+
+        Note:
+            此方法会自动设置 ContextVar，使 get_running_loop() 可用。
         """
-        if isinstance(awaitable, Task):
-            task = awaitable
-        elif isinstance(awaitable, Future):
-            task = awaitable
-        else:
-            task = self.create_task(awaitable)
-        self.run_until_complete(task)
-        return task.result()
+        token = _loop_var.set(self)
+        try:
+            if isinstance(awaitable, Task):
+                task = awaitable
+            elif isinstance(awaitable, Future):
+                task = awaitable
+            else:
+                task = self.create_task(awaitable)
+            self.run_until_complete(task)
+            return task.result()
+        finally:
+            _loop_var.reset(token)
 
     def run_until_complete(self, main_task: Task):
         self._running = True
@@ -536,10 +1042,10 @@ class EventLoop:
         except Exception as e:
             # 构建上下文信息
             context = {
-                'message': 'Exception in callback',
-                'exception': e,
-                'callback': cb,
-                'args': args,
+                "message": "Exception in callback",
+                "exception": e,
+                "callback": cb,
+                "args": args,
             }
             self.call_exception_handler(context)
 
@@ -604,13 +1110,27 @@ class EventLoop:
         self._running = False
 
 
-def sleep(delay):
-    """返回一个 Future，事件循环在 delay 秒后 set_result"""
+def sleep(delay: float) -> Future:
+    """
+    异步睡眠
+
+    创建一个 Future，在 delay 秒后完成。
+    支持取消：如果 Future 被取消，定时器也会被取消。
+
+    Args:
+        delay: 睡眠时间（秒）
+
+    Returns:
+        Future: 代表睡眠操作的 Future
+
+    Example:
+        >>> await sleep(1.0)  # 睡眠 1 秒
+    """
     loop = get_running_loop()
     f = loop.create_future()
     handle = loop.call_later(delay, f.set_result, None)
 
-    def on_cancel(fut):
+    def on_cancel(fut: Future) -> None:
         if fut.cancelled() and not handle.cancelled():
             handle.cancel()
 
@@ -618,30 +1138,69 @@ def sleep(delay):
     return f
 
 
-def run(awaitable: Awaitable | Generator[Future, Any, Any]):
+def run(awaitable: Union[Awaitable[Any], Generator[Future, Any, Any]]) -> Any:
     """
-    模块级入口，类似 asyncio.run(awaitable)
-    每次调用会创建一个新的事件循环，运行完后自动关闭并清理。
-    禁止嵌套调用。
-    """
-    global current_loop
+    运行异步代码的入口点
 
-    if current_loop is not None:
+    类似 asyncio.run()，创建一个新的事件循环，运行 awaitable，
+    然后自动关闭并清理事件循环。
+
+    Args:
+        awaitable: 要运行的协程、生成器或 Future
+
+    Returns:
+        Any: awaitable 的返回值
+
+    Raises:
+        RuntimeError: 如果已经有事件循环在运行（禁止嵌套调用）
+
+    Example:
+        >>> async def main():
+        ...     await sleep(1)
+        ...     return "done"
+        >>> result = run(main())
+    """
+    # 检查是否已有事件循环在运行
+    if _loop_var.get() is not None:
         raise RuntimeError("Cannot run the event loop while another is running")
 
     loop = EventLoop()
-    current_loop = loop
+
+    # 使用 ContextVar 设置当前事件循环（自动恢复）
+    token = _loop_var.set(loop)
     try:
         return loop.run(awaitable)
     finally:
         loop.close()
-        current_loop = None
+        _loop_var.reset(token)  # 恢复之前的上下文
 
 
-def gather(*coro_s: Awaitable | Generator[Future, Any, Any] | Task):
+def gather(*coro_s: Union[Awaitable[Any], Generator[Future, Any, Any], Task]) -> Future:
     """
-    并发运行多个生成器，并等待它们全部完成。
-    返回一个 Future，其结果是按顺序排列的所有生成器返回值。
+    并发运行多个协程/任务，等待它们全部完成
+
+    类似 asyncio.gather()，并发执行多个异步操作，
+    并返回一个包含所有结果的列表（按输入顺序）。
+    如果任何一个任务失败，会取消其他所有任务。
+
+    Args:
+        *coro_s: 要并发执行的协程、生成器或 Task
+
+    Returns:
+        Future: 结果是按顺序排列的所有返回值列表
+
+    Raises:
+        Exception: 如果任何一个任务抛出异常
+
+    Example:
+        >>> async def task1():
+        ...     await sleep(0.1)
+        ...     return "result1"
+        >>> async def task2():
+        ...     await sleep(0.2)
+        ...     return "result2"
+        >>> results = await gather(task1(), task2())
+        >>> print(results)  # ["result1", "result2"]
     """
     loop = get_running_loop()
     all_done_future = loop.create_future()
@@ -698,10 +1257,34 @@ def gather(*coro_s: Awaitable | Generator[Future, Any, Any] | Task):
     return all_done_future
 
 
-def wait(fs, timeout=None, return_when=ALL_COMPLETED):
+def wait(
+    fs: List[Union[Awaitable[Any], Generator[Future, Any, Any], Task]],
+    timeout: Optional[float] = None,
+    return_when: str = ALL_COMPLETED,
+) -> Future:
     """
-    等待一组任务完成。
-    返回: (done_set, pending_set)
+    等待一组任务完成
+
+    类似 asyncio.wait()，等待多个异步操作完成，
+    并根据 return_when 参数决定何时返回。
+
+    Args:
+        fs: 要等待的协程、生成器或 Task 列表
+        timeout: 超时时间（秒），None 表示不超时
+        return_when: 返回条件：
+            - FIRST_COMPLETED: 第一个任务完成时返回
+            - FIRST_EXCEPTION: 第一个任务异常或全部完成时返回
+            - ALL_COMPLETED: 所有任务完成时返回（默认）
+
+    Returns:
+        Future: 结果是 (done_set, pending_set) 元组
+            - done_set: 已完成的任务集合
+            - pending_set: 未完成的任务集合
+
+    Example:
+        >>> done, pending = await wait([task1, task2], timeout=5.0)
+        >>> for task in done:
+        ...     print(task.result())
     """
     loop = get_running_loop()
     wait_future = loop.create_future()
@@ -758,6 +1341,7 @@ def wait(fs, timeout=None, return_when=ALL_COMPLETED):
 
     # 处理超时逻辑
     if timeout is not None:
+
         def _on_timeout():
             if not wait_future.done():
                 wait_future.set_result((done, pending))
@@ -767,9 +1351,33 @@ def wait(fs, timeout=None, return_when=ALL_COMPLETED):
     return wait_future
 
 
-def wait_for(aw, timeout):
+def wait_for(
+    aw: Union[Awaitable[Any], Generator[Future, Any, Any]], timeout: float
+) -> Future:
     """
-    等待一个协程或 Future 完成，如果超时则取消并抛出 TimeoutError。
+    等待单个异步操作完成，带超时限制
+
+    类似 asyncio.wait_for()，如果操作在 timeout 秒内未完成，
+    则取消该操作并抛出 TimeoutError。
+
+    Args:
+        aw: 要等待的协程、生成器或 Task
+        timeout: 超时时间（秒）
+
+    Returns:
+        Future: 异步操作的结果
+
+    Raises:
+        TimeoutError: 如果操作超时
+
+    Example:
+        >>> async def slow_task():
+        ...     await sleep(10)
+        ...     return "done"
+        >>> try:
+        ...     result = await wait_for(slow_task(), timeout=1.0)
+        ... except TimeoutError:
+        ...     print("Task timed out")
     """
     loop = get_running_loop()
     done_future = loop.create_future()
@@ -939,9 +1547,10 @@ def main():
         if not r:
             print("任务未取消")
 
-    task1_task = current_loop.create_task(task1())
-    task2_task = current_loop.create_task(task2())  # 同时运行
-    cancel_task_task = current_loop.create_task(cancel_task(task1_task))
+    loop = get_running_loop()
+    task1_task = loop.create_task(task1())
+    task2_task = loop.create_task(task2())  # 同时运行
+    cancel_task_task = loop.create_task(cancel_task(task1_task))
 
     # print((yield task1_task))
     # print((yield task2_task))
@@ -980,8 +1589,10 @@ def main3():
 
 async def main4():
     s = AsyncSocket(socket.socket())
-    await s.connect(('www.baidu.com', 80))
-    await s.sendall(b"GET / HTTP/1.1\r\nHost: www.baidu.com\r\nConnection: close\r\n\r\n")
+    await s.connect(("www.baidu.com", 80))
+    await s.sendall(
+        b"GET / HTTP/1.1\r\nHost: www.baidu.com\r\nConnection: close\r\n\r\n"
+    )
 
     # 接收完整响应
     response = await s.recv_all()
@@ -1078,10 +1689,7 @@ async def main6():
         raise ValueError(" intentional error")
 
     try:
-        results = await gather(
-            success_task(),
-            failing_task()
-        )
+        results = await gather(success_task(), failing_task())
         print(f"结果: {results}")
     except ValueError as e:
         print(f"\n✅ Gather 失败，捕获异常: {e}")

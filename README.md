@@ -1,1 +1,538 @@
-# simple_asyncio
+# Simple Asyncio - 微型异步事件循环框架
+
+[![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
+一个**从零实现**的简化版 asyncio 框架，深入理解 Python 异步编程的核心机制。
+
+---
+
+## 📖 项目简介
+
+`simple_asyncio` 是一个教育性质的微型异步事件循环实现，完整复刻了 Python `asyncio` 的核心功能：
+
+- ✅ **事件循环** - 基于 `selectors` 的 I/O 多路复用
+- ✅ **Future/Task 系统** - 协程调度和状态管理
+- ✅ **定时器管理** - 延迟回调和超时控制
+- ✅ **线程安全调度** - `call_soon_threadsafe` 实现
+- ✅ **异步原语** - `sleep`, `gather`, `wait`, `wait_for`
+- ✅ **异步 Socket** - 非阻塞网络编程支持
+- ✅ **协作式多任务** - 同步生成器通过 `yield_control()` 参与调度
+
+> 🎯 **目标**: 通过阅读源码，彻底理解异步编程的底层原理（事件循环、协程调度、I/O 多路复用等）。
+
+---
+
+## 🚀 快速开始
+
+### 安装
+
+无需安装！直接导入即可使用：
+
+```python
+import sys
+sys.path.insert(0, '/path/to/simple_asyncio')
+
+from simple_asyncio import run, sleep, gather
+```
+
+### 基础示例
+
+#### 1. 运行异步协程
+
+```python
+from simple_asyncio import run, sleep
+
+async def hello():
+    print("Hello")
+    await sleep(1)  # 异步睡眠 1 秒
+    print("World!")
+    return "done"
+
+result = run(hello())
+print(f"Result: {result}")
+```
+
+#### 2. 并发执行多个任务
+
+```python
+from simple_asyncio import run, sleep, gather
+
+async def task(name, delay):
+    print(f"[{name}] 开始")
+    await sleep(delay)
+    print(f"[{name}] 完成")
+    return f"{name} 结果"
+
+# 并发执行 3 个任务
+results = run(gather(
+    task("A", 0.5),
+    task("B", 0.3),
+    task("C", 0.7)
+))
+
+print(f"所有结果: {results}")
+```
+
+#### 3. 同步代码参与异步调度
+
+```python
+from simple_asyncio import run, sleep, yield_control, get_event_loop
+
+def cpu_heavy_task(task_id):
+    """同步 CPU 密集型任务，通过 yield_control() 让出控制权"""
+    for step in range(5):
+        # 模拟计算
+        result = sum(i * i for i in range(10000))
+        print(f"[Task {task_id}] 步骤 {step + 1}/5")
+        
+        # ⚠️ 关键：让出控制权给其他任务
+        yield yield_control()
+    
+    return f"Task {task_id} 完成"
+
+async def io_task(name):
+    """异步 I/O 任务"""
+    print(f"[{name}] 开始 I/O")
+    await sleep(0.1)
+    print(f"[{name}] I/O 完成")
+    return f"{name} 结果"
+
+loop = get_event_loop()
+
+# 混合执行同步和异步任务
+sync_task = loop.create_task(cpu_heavy_task(1))
+async_task = loop.create_task(io_task("IO"))
+
+results = run(loop.gather(sync_task, async_task))
+print(f"结果: {results}")
+```
+
+---
+
+## 📚 核心组件
+
+### 1. EventLoop - 事件循环
+
+事件循环是整个框架的核心，负责：
+- 调度和管理异步任务
+- 处理 I/O 多路复用（基于 `selectors`）
+- 管理定时器
+- 提供线程安全的回调调度
+
+```python
+from simple_asyncio import EventLoop, get_running_loop
+
+loop = EventLoop()
+
+# 创建任务
+async def my_coro():
+    loop = get_running_loop()  # 获取当前事件循环
+    await sleep(1)
+    return "done"
+
+task = loop.create_task(my_coro(), name="MyTask")
+loop.run_until_complete(task)
+print(task.result())
+
+loop.close()
+```
+
+### 2. Future & Task - 异步原语
+
+**Future**: 代表尚未完成的异步操作结果。
+
+```python
+from simple_asyncio import Future, get_event_loop
+
+loop = get_event_loop()
+future = loop.create_future()
+
+# 设置结果
+future.set_result("hello")
+
+# 获取结果
+print(future.result())  # "hello"
+
+# 取消 Future
+future.cancel(msg="用户取消")
+print(future.cancelled())  # True
+print(future.cancel_msg())  # "用户取消"
+```
+
+**Task**: 包装协程/生成器，驱动其一步步执行。
+
+```python
+from simple_asyncio import Task, get_event_loop
+
+async def my_coro():
+    await sleep(1)
+    return "done"
+
+loop = get_event_loop()
+task = loop.create_task(my_coro(), name="MyTask")
+
+# 检查状态
+print(task.done())      # False
+print(task.cancelled()) # False
+
+# 取消任务
+task.cancel(msg="测试取消")
+print(task.cancelled())  # True
+```
+
+### 3. TimerHandle - 定时器管理
+
+```python
+from simple_asyncio import get_event_loop, sleep
+
+loop = get_event_loop()
+
+def callback(value):
+    print(f"定时器触发: {value}")
+
+# 创建定时器（0.5 秒后执行）
+handle = loop.call_later(0.5, callback, "hello")
+
+# 取消定时器
+handle.cancel()
+
+await sleep(1)  # 等待观察
+```
+
+### 4. 线程安全调度
+
+```python
+from simple_asyncio import get_event_loop, sleep
+import threading
+
+loop = get_event_loop()
+
+def thread_func():
+    """从其他线程向事件循环提交回调"""
+    print("[Thread] 提交回调...")
+    loop.call_soon_threadsafe(lambda: print("[EventLoop] 回调执行"))
+
+# 启动线程
+thread = threading.Thread(target=thread_func)
+thread.start()
+thread.join()
+
+await sleep(0.1)  # 等待回调执行
+```
+
+### 5. 异步 Socket
+
+```python
+from simple_asyncio import AsyncSocket, run
+
+async def tcp_client():
+    sock = AsyncSocket(socket.AF_INET, socket.SOCK_STREAM)
+    await sock.connect(('127.0.0.1', 8080))
+    
+    await sock.send(b"Hello Server")
+    data = await sock.recv(1024)
+    
+    print(f"收到: {data.decode()}")
+    sock.close()
+
+run(tcp_client())
+```
+
+---
+
+## 🎯 高级特性
+
+### ContextVar 上下文隔离
+
+使用 `ContextVar` 存储当前事件循环，确保：
+- ✅ 线程安全
+- ✅ 协程安全
+- ✅ 防止嵌套调用冲突
+
+```python
+from simple_asyncio import run, get_running_loop, _loop_var
+
+async def check_context():
+    loop = get_running_loop()
+    print(f"当前循环: {id(loop)}")
+    return loop
+
+# 第一个循环
+loop1 = run(check_context())
+
+# 第二个循环（完全独立）
+loop2 = run(check_context())
+
+assert id(loop1) != id(loop2)  # 不同的循环实例
+```
+
+### 任务取消与传播
+
+```python
+from simple_asyncio import run, sleep, CancelledError
+
+async def long_task():
+    try:
+        print("开始长任务...")
+        await sleep(10)
+        return "完成"
+    except CancelledError as e:
+        print(f"任务被取消: {e.cancel_msg()}")
+        raise  # 必须重新抛出
+
+task = None
+
+async def main():
+    global task
+    task = get_event_loop().create_task(long_task())
+    
+    await sleep(0.5)
+    task.cancel(msg="超时取消")
+    
+    try:
+        await task
+    except CancelledError:
+        print("已捕获取消异常")
+
+run(main())
+```
+
+### 超时控制
+
+```python
+from simple_asyncio import run, sleep, wait_for, TimeoutError
+
+async def slow_task():
+    await sleep(5)
+    return "完成"
+
+try:
+    # 设置 1 秒超时
+    result = run(wait_for(slow_task(), timeout=1.0))
+except TimeoutError:
+    print("任务超时！")
+```
+
+---
+
+## 📊 架构设计
+
+### 核心流程图
+
+```
+┌─────────────────────────────────────────────┐
+│              EventLoop                       │
+│                                              │
+│  ┌──────────┐    ┌──────────┐               │
+│  │ _ready   │───▶│ _step()  │               │
+│  │ (deque)  │    │ (Task)   │               │
+│  └──────────┘    └──────────┘               │
+│       ▲                │                     │
+│       │                ▼                     │
+│  ┌──────────┐    ┌──────────┐               │
+│  │Selector  │◀───│ yield    │               │
+│  │(I/O)     │    │ Future   │               │
+│  └──────────┘    └──────────┘               │
+│                                              │
+│  ┌──────────┐                               │
+│  │ Timers   │──▶ call_later()               │
+│  │ (heapq)  │                               │
+│  └──────────┘                               │
+└─────────────────────────────────────────────┘
+```
+
+### 关键设计决策
+
+| 特性 | 实现方式 | 优势 |
+|------|---------|------|
+| **事件循环** | `selectors.select()` | 跨平台 I/O 多路复用 |
+| **线程安全** | `socketpair` + `Lock` | 高效唤醒阻塞的 selector |
+| **上下文管理** | `ContextVar` | 自动继承和恢复 |
+| **定时器** | `heapq` 最小堆 | O(log n) 插入/删除 |
+| **任务调度** | `deque` FIFO | O(1) 入队/出队 |
+
+---
+
+## 🧪 测试
+
+项目包含完整的测试套件：
+
+```bash
+cd  simple_asyncio
+
+# 运行所有测试
+python test/test_future_cancel.py
+python test/test_task_cancel.py
+python test/test_sync_generator.py
+python test/test_timer_handle.py
+python test/test_contextvar.py
+python test/test_eventloop_run_contextvar.py
+```
+
+### 测试覆盖
+
+- ✅ Future 取消和消息传递
+- ✅ Task 命名和取消传播
+- ✅ 同步生成器协作式多任务
+- ✅ TimerHandle 创建、取消和执行
+- ✅ ContextVar 上下文隔离
+- ✅ EventLoop.run() 上下文设置
+
+---
+
+## 📖 学习路径
+
+如果你想深入理解异步编程，建议按以下顺序阅读源码：
+
+1. **Future 类** (第 150-280 行)
+   - 理解异步结果的表示和状态管理
+   
+2. **Task 类** (第 320-500 行)
+   - 理解协程如何被驱动执行
+   
+3. **EventLoop._run_once()** (第 800-900 行)
+   - 理解事件循环的核心调度逻辑
+   
+4. **call_soon_threadsafe()** (第 680-700 行)
+   - 理解线程安全调度的实现原理
+   
+5. **TimerHandle** (第 511-570 行)
+   - 理解定时器管理机制
+
+---
+
+## 🔍 与标准库 asyncio 对比
+
+| 特性 | simple_asyncio | asyncio |
+|------|---------------|---------|
+| **事件循环** | ✅ 基于 selectors | ✅ 基于 epoll/kqueue/IOCP |
+| **Future/Task** | ✅ 完整实现 | ✅ 完整实现 |
+| **定时器** | ✅ heapq 实现 | ✅ 类似实现 |
+| **线程安全** | ✅ socketpair | ✅ self-pipe trick |
+| **ContextVar** | ✅ 完整支持 | ✅ 完整支持 |
+| **原生协程** | ✅ 支持 | ✅ 支持 |
+| **生成器协程** | ✅ 支持 | ⚠️ 已弃用 |
+| **性能优化** | ❌ 无 | ✅ C 扩展优化 |
+| **生产就绪** | ❌ 教育用途 | ✅ 生产级 |
+
+> 💡 **关键区别**: `simple_asyncio` 是纯 Python 实现，用于学习；`asyncio` 有 C 扩展优化，用于生产。
+
+---
+
+## 🛠️ 开发指南
+
+### 添加新功能
+
+1. **添加新的异步原语**
+   ```python
+   def my_new_primitive(arg):
+       loop = get_running_loop()
+       future = loop.create_future()
+       # ... 实现逻辑
+       return future
+   ```
+
+2. **扩展 EventLoop**
+   ```python
+   class EventLoop:
+       def my_custom_method(self):
+           # ... 自定义逻辑
+           pass
+   ```
+
+3. **添加测试**
+   ```python
+   # test/test_my_feature.py
+   from simple_asyncio import run
+   
+   def test_my_feature():
+       result = run(my_async_func())
+       assert result == expected
+   ```
+
+---
+
+## 📝 常见问题
+
+### Q1: 为什么需要 `yield_control()`？
+
+**A**: 允许同步生成器参与异步调度，实现协作式多任务。适用于 CPU 密集型任务需要定期让出控制权的场景。
+
+```python
+def cpu_task():
+    for i in range(1000000):
+        # 计算...
+        if i % 10000 == 0:
+            yield yield_control()  # 让出控制权
+```
+
+### Q2: `call_soon_threadsafe` 的原理是什么？
+
+**A**: 使用两个机制保证线程安全：
+1. **Lock**: 保护 `_ready` 队列的并发访问
+2. **socketpair**: 写入一个字节打断 `selector.select()` 的阻塞
+
+```python
+def call_soon_threadsafe(self, callback, *args):
+    with self._ready_lock:
+        self._ready.append((callback, args))
+    self._wake_loop()  # 写入 socketpair
+```
+
+### Q3: 为什么使用 ContextVar 而不是全局变量？
+
+**A**: ContextVar 提供：
+- ✅ **线程安全**: 每个线程独立的上下文
+- ✅ **协程安全**: 子协程自动继承父协程的上下文
+- ✅ **自动恢复**: `reset(token)` 确保上下文正确清理
+
+### Q4: 可以用于生产环境吗？
+
+**A**: ❌ **不可以**。这是教育项目，缺少：
+- 性能优化（C 扩展）
+- 完善的错误处理
+- 全面的测试覆盖
+- 长期维护承诺
+
+请使用标准库 `asyncio` 进行生产开发。
+
+---
+
+## 🤝 贡献
+
+欢迎提交 Issue 和 Pull Request！
+
+### 贡献指南
+
+1. Fork 本仓库
+2. 创建特性分支 (`git checkout -b feature/amazing-feature`)
+3. 提交更改 (`git commit -m 'Add amazing feature'`)
+4. 推送到分支 (`git push origin feature/amazing-feature`)
+5. 开启 Pull Request
+
+---
+
+## 📄 许可证
+
+MIT License
+
+---
+
+## 🙏 致谢
+
+- Python 官方 `asyncio` 模块 - 设计灵感来源
+- David Beazley 的协程教程 - 深入理解生成器协程
+- Real Python 异步编程文章 - 最佳实践参考
+
+---
+
+## 📧 联系方式
+
+- **Author**: dsdcyy
+- **Created**: 2026/5/4
+- **Project**: simple_asyncio
+
+---
+
+> 💡 **提示**: 这个项目的主要目的是**学习**，不是替代 `asyncio`。通过阅读源码，你将深刻理解异步编程的底层机制！
