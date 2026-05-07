@@ -71,6 +71,14 @@ def get_running_loop() -> "EventLoop":
     return loop
 
 
+def get_running_loop_safe() -> Optional["EventLoop"]:
+    """安全获取当前正在运行的事件循环，若无则返回 None"""
+    try:
+        return get_running_loop()
+    except RuntimeError:
+        return None
+
+
 def get_event_loop() -> "EventLoop":
     """
     获取或创建事件循环
@@ -369,10 +377,10 @@ class Task(Future[_T]):
     )
 
     def __init__(
-            self,
-            gen: Union[Awaitable[Any], Generator[Any, Any, Any]],
-            loop: Optional["EventLoop"] = None,
-            name: Optional[str] = None,
+        self,
+        gen: Union[Awaitable[Any], Generator[Any, Any, Any]],
+        loop: Optional["EventLoop"] = None,
+        name: Optional[str] = None,
     ) -> None:
         """
         初始化 Task
@@ -471,14 +479,15 @@ class Task(Future[_T]):
         """
         在上下文运行 _real_step 方法
         """
-        # 设置当前任务为 self
-        token = _task_var.set(self)
-        try:
-            # 运行 _real_step 方法
-            self._context.run(self._real_step, value, is_exc)
-        finally:
-            # 任务完成后清除当前任务标记
-            _task_var.reset(token)
+
+        def run_step():
+            token = _task_var.set(self)
+            try:
+                self._real_step(value, is_exc)
+            finally:
+                _task_var.reset(token)
+
+        self._context.run(run_step)
 
     def _real_step(self, value: Any = None, is_exc: bool = False) -> None:
         """
@@ -578,11 +587,11 @@ class TimerHandle:
     __slots__ = ("_callback", "_args", "_loop_ref", "_when", "_cancelled")
 
     def __init__(
-            self,
-            callback: Callable[..., Any],
-            args: Tuple[Any, ...],
-            loop: "EventLoop",
-            when: float,
+        self,
+        callback: Callable[..., Any],
+        args: Tuple[Any, ...],
+        loop: "EventLoop",
+        when: float,
     ) -> None:
         """
         初始化定时器句柄
@@ -692,6 +701,9 @@ class EventLoop:
         self._execute_pool: Optional[ThreadPoolExecutor] = None
         self._ready_lock = threading.Lock()  # 保护 _ready 的线程锁
         self._closed = False  # 标记是否已关闭
+        self._thread_wakeup_poll_interval = (
+            0.01  # self-pipe 被限制时的跨线程唤醒兜底轮询间隔
+        )
 
         # 创建自唤醒管道
         self._self_reader, self._self_writer = socket.socketpair()
@@ -793,7 +805,7 @@ class EventLoop:
             pass  # 写端已关闭等异常忽略
 
     def run_in_thread_executor(
-            self, func: Callable[..., Any], *args: Any, **kwargs: Any
+        self, func: Callable[..., Any], *args: Any, **kwargs: Any
     ) -> Future:
         """
         在线程池中异步执行同步函数，返回 Future
@@ -843,7 +855,7 @@ class EventLoop:
         return f
 
     def set_exception_handler(
-            self, handler: Optional[Callable[["EventLoop", dict], None]]
+        self, handler: Optional[Callable[["EventLoop", dict], None]]
     ) -> None:
         """
         设置自定义异常处理器
@@ -898,7 +910,7 @@ class EventLoop:
         self._ready.append((callback, args))
 
     def call_later(
-            self, delay: float, callback: Callable[..., Any], *args: Any
+        self, delay: float, callback: Callable[..., Any], *args: Any
     ) -> TimerHandle:
         """
         延迟执行回调
@@ -924,11 +936,11 @@ class EventLoop:
         return handler
 
     def add_reader(
-            self,
-            fileobj: int,
-            callback: Callable[..., Any],
-            *args: Any,
-            one_shot: bool = False,
+        self,
+        fileobj: int,
+        callback: Callable[..., Any],
+        *args: Any,
+        one_shot: bool = False,
     ) -> None:
         """
         注册文件描述符的可读事件
@@ -942,11 +954,11 @@ class EventLoop:
         self._add_io_callback("read", fileobj, callback, args, one_shot)
 
     def add_writer(
-            self,
-            fileobj: int,
-            callback: Callable[..., Any],
-            *args: Any,
-            one_shot: bool = False,
+        self,
+        fileobj: int,
+        callback: Callable[..., Any],
+        *args: Any,
+        one_shot: bool = False,
     ) -> None:
         """
         注册文件描述符的可写事件
@@ -982,12 +994,12 @@ class EventLoop:
         return fileobj if isinstance(fileobj, int) else fileobj.fileno()
 
     def _add_io_callback(
-            self,
-            direction: str,
-            fileobj: int,
-            callback: Callable[..., Any],
-            args: Tuple[Any, ...],
-            one_shot: bool,
+        self,
+        direction: str,
+        fileobj: int,
+        callback: Callable[..., Any],
+        args: Tuple[Any, ...],
+        one_shot: bool,
     ) -> None:
         """内部：向 selector 的 direction 列表添加回调并更新注册。"""
         fd = self._fd(fileobj)
@@ -1040,7 +1052,7 @@ class EventLoop:
         self._update_selector_registration(fd, data)
 
     def _remove_specific_io_callback(
-            self, direction: str, fileobj: int, callback: Callable[..., Any]
+        self, direction: str, fileobj: int, callback: Callable[..., Any]
     ) -> None:
         """内部：从 direction 列表中移除指定回调（按函数对象匹配）。"""
         fd = self._fd(fileobj)
@@ -1055,11 +1067,11 @@ class EventLoop:
         self._update_selector_registration(fd, data)
 
     def add_reader_threadsafe(
-            self,
-            fileobj: int,
-            callback: Callable[..., Any],
-            *args: Any,
-            one_shot: bool = False,
+        self,
+        fileobj: int,
+        callback: Callable[..., Any],
+        *args: Any,
+        one_shot: bool = False,
     ) -> None:
         """线程安全地注册可读回调（可从其他线程调用）。"""
         # 使用 call_soon_threadsafe 在事件循环线程中执行实际注册
@@ -1068,11 +1080,11 @@ class EventLoop:
         )
 
     def add_writer_threadsafe(
-            self,
-            fileobj: int,
-            callback: Callable[..., Any],
-            *args: Any,
-            one_shot: bool = False,
+        self,
+        fileobj: int,
+        callback: Callable[..., Any],
+        *args: Any,
+        one_shot: bool = False,
     ) -> None:
         """线程安全地注册可写回调（可从其他线程调用）。"""
         self.call_soon_threadsafe(
@@ -1080,13 +1092,13 @@ class EventLoop:
         )
 
     def remove_reader_callback(
-            self, fileobj: int, callback: Callable[..., Any]
+        self, fileobj: int, callback: Callable[..., Any]
     ) -> None:
         """从 `fileobj` 的可读回调列表中移除指定回调（非线程安全）。"""
         self._remove_specific_io_callback("read", fileobj, callback)
 
     def remove_reader_callback_threadsafe(
-            self, fileobj: int, callback: Callable[..., Any]
+        self, fileobj: int, callback: Callable[..., Any]
     ) -> None:
         """线程安全地从 `fileobj` 的可读回调列表中移除指定回调。"""
         self.call_soon_threadsafe(
@@ -1094,13 +1106,13 @@ class EventLoop:
         )
 
     def remove_writer_callback(
-            self, fileobj: int, callback: Callable[..., Any]
+        self, fileobj: int, callback: Callable[..., Any]
     ) -> None:
         """从 `fileobj` 的可写回调列表中移除指定回调（非线程安全）。"""
         self._remove_specific_io_callback("write", fileobj, callback)
 
     def remove_writer_callback_threadsafe(
-            self, fileobj: int, callback: Callable[..., Any]
+        self, fileobj: int, callback: Callable[..., Any]
     ) -> None:
         """线程安全地从 `fileobj` 的可写回调列表中移除指定回调。"""
         self.call_soon_threadsafe(
@@ -1108,9 +1120,9 @@ class EventLoop:
         )
 
     def create_task(
-            self,
-            gen: Union[Generator[Future[_T], Any, Any], Awaitable[_T]],
-            name: Optional[str] = None,
+        self,
+        gen: Union[Generator[Future[_T], Any, Any], Awaitable[_T]],
+        name: Optional[str] = None,
     ) -> Task[_T]:
         """
         创建异步任务
@@ -1156,7 +1168,7 @@ class EventLoop:
         return Future(self)
 
     def gather(
-            self, *coro_s: Union[Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T]]
+        self, *coro_s: Union[Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T]]
     ) -> Future[_T]:
         """
         便捷方法：调用模块级 `gather`。
@@ -1164,10 +1176,10 @@ class EventLoop:
         return gather(*coro_s)
 
     def wait(
-            self,
-            fs: List[Union[Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T]]],
-            timeout: Optional[float] = None,
-            return_when: str = ALL_COMPLETED,
+        self,
+        fs: List[Union[Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T]]],
+        timeout: Optional[float] = None,
+        return_when: str = ALL_COMPLETED,
     ) -> Future[_T]:
         """
         便捷方法：调用模块级 `wait`。
@@ -1175,7 +1187,7 @@ class EventLoop:
         return wait(fs, timeout=timeout, return_when=return_when)
 
     def wait_for(
-            self, aw: Union[Awaitable[_T], Generator[Future[_T], Any, Any]], timeout: float
+        self, aw: Union[Awaitable[_T], Generator[Future[_T], Any, Any]], timeout: float
     ) -> Future[_T]:
         """
         便捷方法：调用模块级 `wait_for`。
@@ -1183,7 +1195,7 @@ class EventLoop:
         return wait_for(aw, timeout=timeout)
 
     def run(
-            self, awaitable: Union[Generator[Future[_T], Any, Any], Task[_T], Future[_T]]
+        self, awaitable: Union[Generator[Future[_T], Any, Any], Task[_T], Future[_T]]
     ) -> _T:
         """
         直接运行一个 awaitable（生成器/Task/Future）并返回最终结果。
@@ -1257,8 +1269,8 @@ class EventLoop:
         fd = key.fileobj
 
         for direction, event_flag in (
-                ("read", selectors.EVENT_READ),
-                ("write", selectors.EVENT_WRITE),
+            ("read", selectors.EVENT_READ),
+            ("write", selectors.EVENT_WRITE),
         ):
             if not (mask & event_flag):
                 continue
@@ -1303,13 +1315,17 @@ class EventLoop:
                 if handler.cancelled():
                     continue
                 handler.run()
-            timeout: float | None = None
+            _timeout: float | None = None
             if self._ready:
-                timeout = 0.0
+                _timeout = 0.0
             elif self._scheduled:
-                timeout = max(self._scheduled[0][0] - now, 0.0)
+                _timeout = max(self._scheduled[0][0] - now, 0.0)
+            elif len(self._selector.get_map()) <= 1:
+                # 只剩自唤醒管道时，仍可能等待其他线程提交回调。
+                # 某些受限环境可能禁止跨线程写 socketpair，保留短轮询兜底。
+                _timeout = self._thread_wakeup_poll_interval
             # 获取selector的事件列表
-            events = self._selector.select(timeout)
+            events = self._selector.select(_timeout)
             for key, mask in events:
                 # 将事件处理委托到单独方法，减少重复并提高可测性
                 try:
@@ -1339,14 +1355,14 @@ class EventLoop:
 
             if self._ready:
                 continue  # 有就绪任务，继续处理
-
-            # 如果没有就绪任务，且没有定时器
-            if not self._scheduled:
-                # 检查 IO 状态：如果只剩下自唤醒管道 (Self-Pipe) 还在监听，说明已无实际 IO 任务
-                if len(self._selector.get_map()) <= 1:
-                    if not main_task.done():
-                        raise RuntimeError("Loop stopped before task completed")
-                    break
+            # if not self._scheduled:
+            #     # 检查 IO 状态：如果只剩下自唤醒管道 (Self-Pipe) 还在监听，说明已无实际 IO 任务
+            #     if len(self._selector.get_map()) <= 1:
+            #         if not main_task.done():
+            #             raise RuntimeError("Loop stopped before task completed")
+            #         break
+            # 即使当前没有定时器或真实 I/O，也可能有其他线程稍后通过
+            # call_soon_threadsafe 写入 self-pipe 唤醒循环，因此继续等待 selector。
 
     def _cancel_other_tasks(self, main_task):
         for t in list(self._tasks):
@@ -1357,10 +1373,10 @@ class EventLoop:
         self._running = False
 
     def ensure_task(
-            self,
-            task: Union[
-                Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T], Future[_T]
-            ],
+        self,
+        task: Union[
+            Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T], Future[_T]
+        ],
     ) -> Task[_T]:
         """
         确保输入被转换为 Task 对象
@@ -1397,7 +1413,7 @@ class EventLoop:
             new_task = self.create_task(wrapper())
             return new_task
         elif isinstance(task, (GeneratorType, CoroutineType)) or hasattr(
-                task, "__await__"
+            task, "__await__"
         ):
             # 协程或生成器，创建新的 Task
             return self.create_task(task)
@@ -1474,7 +1490,7 @@ def run(awaitable: Union[Awaitable[_T], Generator[Future[_T], Any, Any]]) -> _T:
 
 
 def gather(
-        *coro_s: Union[Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T]]
+    *coro_s: Union[Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T]]
 ) -> Future[_T]:
     """
     并发运行多个协程/任务，等待它们全部完成
@@ -1564,9 +1580,9 @@ def gather(
 
 
 def wait(
-        fs: List[Union[Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T]]],
-        timeout: Optional[float] = None,
-        return_when: str = ALL_COMPLETED,
+    fs: List[Union[Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T]]],
+    timeout: Optional[float] = None,
+    return_when: str = ALL_COMPLETED,
 ) -> Future[_T]:
     """
     等待一组任务完成
@@ -1658,7 +1674,7 @@ def wait(
 
 
 def wait_for(
-        aw: Union[Awaitable[_T], Generator[Future[_T], Any, Any]], timeout: float
+    aw: Union[Awaitable[_T], Generator[Future[_T], Any, Any]], timeout: float
 ) -> Future[_T]:
     """
     等待单个异步操作完成，带超时限制
@@ -1718,7 +1734,7 @@ def wait_for(
 
 
 def create_task(
-        aw: Union[Awaitable[_T], Generator[Future[_T], Any, Any]], name: str = None
+    aw: Union[Awaitable[_T], Generator[Future[_T], Any, Any]], name: str = None
 ) -> Task[_T]:
     """
     创建一个 Task 对象
@@ -1744,6 +1760,7 @@ class TimeoutContext:
         >>> async with timeout(1.5):
         ...     await slow_operation()
     """
+
     def __init__(self, delay: float) -> None:
         """
         初始化超时上下文
@@ -1973,13 +1990,13 @@ class BaseAsyncLock:
     def __init__(self):
         self._event = Event()
         # 记录初始化时的事件循环，用于跨线程安全调度
-        self._loop = get_running_loop()
+        self._loop = get_running_loop_safe()
         # 默认初始状态为放行
         self._event.set()
 
     def _safe_dispatch(self, action_name: str):
         """通用跨线程安全调度器"""
-        current_loop = get_running_loop()
+        current_loop = get_running_loop_safe()
 
         # 获取对应的 Event 方法 (set 或 clear)
         action = getattr(self._event, action_name)
