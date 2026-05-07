@@ -1749,7 +1749,7 @@ def create_task(
     return loop.create_task(aw, name=name)
 
 
-class TimeoutContext:
+class _TimeoutContext:
     """
     异步超时上下文管理器
 
@@ -1792,16 +1792,16 @@ class TimeoutContext:
             raise TimeoutError() from exc_val
 
 
-def timeout(delay: float) -> TimeoutContext:
+def timeout(delay: float) -> _TimeoutContext:
     """
     创建一个异步超时上下文管理器
 
     Args:
         delay: 超时秒数
     Returns:
-        TimeoutContext: 上下文管理器实例
+        _TimeoutContext: 上下文管理器实例
     """
-    return TimeoutContext(delay)
+    return _TimeoutContext(delay)
 
 
 class AsyncSocket:
@@ -1918,10 +1918,16 @@ class AsyncSocket:
 
 
 class QueueFullError(Exception):
+    """
+    队列已满异常
+    """
     pass
 
 
 class QueueEmptyError(Exception):
+    """
+    队列为空异常
+    """
     pass
 
 
