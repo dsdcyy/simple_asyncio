@@ -40,10 +40,15 @@ from typing import (
     Set,
     List,
     Union,
+    TypeVar,
+    Generic,
 )
 
+_T = TypeVar("_T")
 # 使用 ContextVar 存储当前事件循环（线程安全、协程安全）
 _loop_var: ContextVar[Optional["EventLoop"]] = ContextVar("_loop", default=None)
+# 用于存储当前正在运行的任务（线程安全、协程安全）
+_task_var: ContextVar[Optional["Task"]] = ContextVar("_task", default=None)
 
 FIRST_COMPLETED = "FIRST_COMPLETED"
 FIRST_EXCEPTION = "FIRST_EXCEPTION"
@@ -132,7 +137,7 @@ def yield_control() -> YieldControl:
     return YieldControl()
 
 
-class Future:
+class Future(Generic[_T]):
     """
     异步操作的结果占位符
 
@@ -206,7 +211,7 @@ class Future:
         for cb in callbacks:
             self._loop.call_soon(cb, self)
 
-    def set_result(self, result: Any) -> None:
+    def set_result(self, result: _T) -> None:
         """
         设置 Future 的结果
 
@@ -264,12 +269,12 @@ class Future:
         self._check_done(False)
         return self._exception
 
-    def result(self) -> Any:
+    def result(self) -> _T:
         """
         获取 Future 的结果
 
         Returns:
-            Any: 操作结果
+            _T: 操作结果
 
         Raises:
             RuntimeError: 如果 Future 还未完成
@@ -280,7 +285,7 @@ class Future:
             raise self._exception
         return self._result
 
-    def __iter__(self) -> Generator["Future", Any, Any]:
+    def __iter__(self) -> Generator["Future[_T]", Any, Any]:
         """
         让 Future 可被 yield，生成器通过 yield future 来等待
 
@@ -290,7 +295,7 @@ class Future:
         result = yield self
         return result
 
-    def __await__(self) -> Generator["Future", Any, Any]:
+    def __await__(self) -> Generator["Future[_T]", Any, Any]:
         """
         让 Future 可被 await，支持原生协程
 
@@ -337,7 +342,7 @@ class Future:
         return self._cancel_msg
 
 
-class Task(Future):
+class Task(Future[_T]):
     """
     异步任务，将生成器或协程包装成 Future
 
@@ -364,10 +369,10 @@ class Task(Future):
     )
 
     def __init__(
-        self,
-        gen: Union[Awaitable[Any], Generator[Any, Any, Any]],
-        loop: Optional["EventLoop"] = None,
-        name: Optional[str] = None,
+            self,
+            gen: Union[Awaitable[Any], Generator[Any, Any, Any]],
+            loop: Optional["EventLoop"] = None,
+            name: Optional[str] = None,
     ) -> None:
         """
         初始化 Task
@@ -452,11 +457,28 @@ class Task(Future):
         self._loop.call_soon(self._step)
         return True
 
+    @staticmethod
+    def current_task() -> Optional["Task"]:
+        """
+        获取当前正在运行的任务
+
+        Returns:
+            Task 或 None: 当前任务（如果有）
+        """
+        return _task_var.get()
+
     def _step(self, value: Any = None, is_exc: bool = False) -> None:
         """
         在上下文运行 _real_step 方法
         """
-        self._context.run(self._real_step, value, is_exc)
+        # 设置当前任务为 self
+        token = _task_var.set(self)
+        try:
+            # 运行 _real_step 方法
+            self._context.run(self._real_step, value, is_exc)
+        finally:
+            # 任务完成后清除当前任务标记
+            _task_var.reset(token)
 
     def _real_step(self, value: Any = None, is_exc: bool = False) -> None:
         """
@@ -556,11 +578,11 @@ class TimerHandle:
     __slots__ = ("_callback", "_args", "_loop_ref", "_when", "_cancelled")
 
     def __init__(
-        self,
-        callback: Callable[..., Any],
-        args: Tuple[Any, ...],
-        loop: "EventLoop",
-        when: float,
+            self,
+            callback: Callable[..., Any],
+            args: Tuple[Any, ...],
+            loop: "EventLoop",
+            when: float,
     ) -> None:
         """
         初始化定时器句柄
@@ -683,6 +705,15 @@ class EventLoop:
             {"read": [(self._consume_wake, (), False)], "write": []},
         )
 
+    def is_running(self) -> bool:
+        """
+        检查事件循环是否正在运行
+
+        Returns:
+            bool: 如果正在运行返回 True
+        """
+        return self._running
+
     def is_closed(self) -> bool:
         """
         检查事件循环是否已关闭
@@ -762,7 +793,7 @@ class EventLoop:
             pass  # 写端已关闭等异常忽略
 
     def run_in_thread_executor(
-        self, func: Callable[..., Any], *args: Any, **kwargs: Any
+            self, func: Callable[..., Any], *args: Any, **kwargs: Any
     ) -> Future:
         """
         在线程池中异步执行同步函数，返回 Future
@@ -812,7 +843,7 @@ class EventLoop:
         return f
 
     def set_exception_handler(
-        self, handler: Optional[Callable[["EventLoop", dict], None]]
+            self, handler: Optional[Callable[["EventLoop", dict], None]]
     ) -> None:
         """
         设置自定义异常处理器
@@ -867,7 +898,7 @@ class EventLoop:
         self._ready.append((callback, args))
 
     def call_later(
-        self, delay: float, callback: Callable[..., Any], *args: Any
+            self, delay: float, callback: Callable[..., Any], *args: Any
     ) -> TimerHandle:
         """
         延迟执行回调
@@ -893,11 +924,11 @@ class EventLoop:
         return handler
 
     def add_reader(
-        self,
-        fileobj: int,
-        callback: Callable[..., Any],
-        *args: Any,
-        one_shot: bool = False,
+            self,
+            fileobj: int,
+            callback: Callable[..., Any],
+            *args: Any,
+            one_shot: bool = False,
     ) -> None:
         """
         注册文件描述符的可读事件
@@ -911,11 +942,11 @@ class EventLoop:
         self._add_io_callback("read", fileobj, callback, args, one_shot)
 
     def add_writer(
-        self,
-        fileobj: int,
-        callback: Callable[..., Any],
-        *args: Any,
-        one_shot: bool = False,
+            self,
+            fileobj: int,
+            callback: Callable[..., Any],
+            *args: Any,
+            one_shot: bool = False,
     ) -> None:
         """
         注册文件描述符的可写事件
@@ -951,12 +982,12 @@ class EventLoop:
         return fileobj if isinstance(fileobj, int) else fileobj.fileno()
 
     def _add_io_callback(
-        self,
-        direction: str,
-        fileobj: int,
-        callback: Callable[..., Any],
-        args: Tuple[Any, ...],
-        one_shot: bool,
+            self,
+            direction: str,
+            fileobj: int,
+            callback: Callable[..., Any],
+            args: Tuple[Any, ...],
+            one_shot: bool,
     ) -> None:
         """内部：向 selector 的 direction 列表添加回调并更新注册。"""
         fd = self._fd(fileobj)
@@ -1009,7 +1040,7 @@ class EventLoop:
         self._update_selector_registration(fd, data)
 
     def _remove_specific_io_callback(
-        self, direction: str, fileobj: int, callback: Callable[..., Any]
+            self, direction: str, fileobj: int, callback: Callable[..., Any]
     ) -> None:
         """内部：从 direction 列表中移除指定回调（按函数对象匹配）。"""
         fd = self._fd(fileobj)
@@ -1024,11 +1055,11 @@ class EventLoop:
         self._update_selector_registration(fd, data)
 
     def add_reader_threadsafe(
-        self,
-        fileobj: int,
-        callback: Callable[..., Any],
-        *args: Any,
-        one_shot: bool = False,
+            self,
+            fileobj: int,
+            callback: Callable[..., Any],
+            *args: Any,
+            one_shot: bool = False,
     ) -> None:
         """线程安全地注册可读回调（可从其他线程调用）。"""
         # 使用 call_soon_threadsafe 在事件循环线程中执行实际注册
@@ -1037,11 +1068,11 @@ class EventLoop:
         )
 
     def add_writer_threadsafe(
-        self,
-        fileobj: int,
-        callback: Callable[..., Any],
-        *args: Any,
-        one_shot: bool = False,
+            self,
+            fileobj: int,
+            callback: Callable[..., Any],
+            *args: Any,
+            one_shot: bool = False,
     ) -> None:
         """线程安全地注册可写回调（可从其他线程调用）。"""
         self.call_soon_threadsafe(
@@ -1049,13 +1080,13 @@ class EventLoop:
         )
 
     def remove_reader_callback(
-        self, fileobj: int, callback: Callable[..., Any]
+            self, fileobj: int, callback: Callable[..., Any]
     ) -> None:
         """从 `fileobj` 的可读回调列表中移除指定回调（非线程安全）。"""
         self._remove_specific_io_callback("read", fileobj, callback)
 
     def remove_reader_callback_threadsafe(
-        self, fileobj: int, callback: Callable[..., Any]
+            self, fileobj: int, callback: Callable[..., Any]
     ) -> None:
         """线程安全地从 `fileobj` 的可读回调列表中移除指定回调。"""
         self.call_soon_threadsafe(
@@ -1063,13 +1094,13 @@ class EventLoop:
         )
 
     def remove_writer_callback(
-        self, fileobj: int, callback: Callable[..., Any]
+            self, fileobj: int, callback: Callable[..., Any]
     ) -> None:
         """从 `fileobj` 的可写回调列表中移除指定回调（非线程安全）。"""
         self._remove_specific_io_callback("write", fileobj, callback)
 
     def remove_writer_callback_threadsafe(
-        self, fileobj: int, callback: Callable[..., Any]
+            self, fileobj: int, callback: Callable[..., Any]
     ) -> None:
         """线程安全地从 `fileobj` 的可写回调列表中移除指定回调。"""
         self.call_soon_threadsafe(
@@ -1077,10 +1108,10 @@ class EventLoop:
         )
 
     def create_task(
-        self,
-        gen: Union[Generator[Future, Any, Any], Awaitable[Any]],
-        name: Optional[str] = None,
-    ) -> Task:
+            self,
+            gen: Union[Generator[Future[_T], Any, Any], Awaitable[_T]],
+            name: Optional[str] = None,
+    ) -> Task[_T]:
         """
         创建异步任务
 
@@ -1125,33 +1156,35 @@ class EventLoop:
         return Future(self)
 
     def gather(
-        self, *coro_s: Union[Awaitable[Any], Generator[Future, Any, Any], Task]
-    ) -> Future:
+            self, *coro_s: Union[Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T]]
+    ) -> Future[_T]:
         """
         便捷方法：调用模块级 `gather`。
         """
         return gather(*coro_s)
 
     def wait(
-        self,
-        fs: List[Union[Awaitable[Any], Generator[Future, Any, Any], Task]],
-        timeout: Optional[float] = None,
-        return_when: str = ALL_COMPLETED,
-    ) -> Future:
+            self,
+            fs: List[Union[Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T]]],
+            timeout: Optional[float] = None,
+            return_when: str = ALL_COMPLETED,
+    ) -> Future[_T]:
         """
         便捷方法：调用模块级 `wait`。
         """
         return wait(fs, timeout=timeout, return_when=return_when)
 
     def wait_for(
-        self, aw: Union[Awaitable[Any], Generator[Future, Any, Any]], timeout: float
-    ) -> Future:
+            self, aw: Union[Awaitable[_T], Generator[Future[_T], Any, Any]], timeout: float
+    ) -> Future[_T]:
         """
         便捷方法：调用模块级 `wait_for`。
         """
         return wait_for(aw, timeout=timeout)
 
-    def run(self, awaitable: Union[Generator[Future, Any, Any], Task, Future]) -> Any:
+    def run(
+            self, awaitable: Union[Generator[Future[_T], Any, Any], Task[_T], Future[_T]]
+    ) -> _T:
         """
         直接运行一个 awaitable（生成器/Task/Future）并返回最终结果。
 
@@ -1178,7 +1211,7 @@ class EventLoop:
         finally:
             _loop_var.reset(token)
 
-    def run_until_complete(self, main_task: Task):
+    def run_until_complete(self, main_task: Task[_T]) -> _T:
         self._running = True
         main_task.add_done_callback(lambda _: self.stop())
         self._run_once(main_task)  # 主循环（直到主任务完成）
@@ -1189,6 +1222,7 @@ class EventLoop:
         if self._tasks:
             self._running = True
             self._run_once(main_task)
+        return main_task.result()
 
     def _complete_a_task(self):
 
@@ -1223,8 +1257,8 @@ class EventLoop:
         fd = key.fileobj
 
         for direction, event_flag in (
-            ("read", selectors.EVENT_READ),
-            ("write", selectors.EVENT_WRITE),
+                ("read", selectors.EVENT_READ),
+                ("write", selectors.EVENT_WRITE),
         ):
             if not (mask & event_flag):
                 continue
@@ -1323,8 +1357,11 @@ class EventLoop:
         self._running = False
 
     def ensure_task(
-        self, task: Union[Awaitable[Any], Generator[Future, Any, Any], Task, Future]
-    ) -> Task:
+            self,
+            task: Union[
+                Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T], Future[_T]
+            ],
+    ) -> Task[_T]:
         """
         确保输入被转换为 Task 对象
 
@@ -1360,7 +1397,7 @@ class EventLoop:
             new_task = self.create_task(wrapper())
             return new_task
         elif isinstance(task, (GeneratorType, CoroutineType)) or hasattr(
-            task, "__await__"
+                task, "__await__"
         ):
             # 协程或生成器，创建新的 Task
             return self.create_task(task)
@@ -1371,7 +1408,7 @@ class EventLoop:
             )
 
 
-def sleep(delay: float) -> Future:
+def sleep(delay: float) -> Future[None]:
     """
     异步睡眠
 
@@ -1399,7 +1436,7 @@ def sleep(delay: float) -> Future:
     return f
 
 
-def run(awaitable: Union[Awaitable[Any], Generator[Future, Any, Any]]) -> Any:
+def run(awaitable: Union[Awaitable[_T], Generator[Future[_T], Any, Any]]) -> _T:
     """
     运行异步代码的入口点
 
@@ -1436,7 +1473,9 @@ def run(awaitable: Union[Awaitable[Any], Generator[Future, Any, Any]]) -> Any:
         _loop_var.reset(token)  # 恢复之前的上下文
 
 
-def gather(*coro_s: Union[Awaitable[Any], Generator[Future, Any, Any], Task]) -> Future:
+def gather(
+        *coro_s: Union[Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T]]
+) -> Future[_T]:
     """
     并发运行多个协程/任务，等待它们全部完成
 
@@ -1525,10 +1564,10 @@ def gather(*coro_s: Union[Awaitable[Any], Generator[Future, Any, Any], Task]) ->
 
 
 def wait(
-    fs: List[Union[Awaitable[Any], Generator[Future, Any, Any], Task]],
-    timeout: Optional[float] = None,
-    return_when: str = ALL_COMPLETED,
-) -> Future:
+        fs: List[Union[Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T]]],
+        timeout: Optional[float] = None,
+        return_when: str = ALL_COMPLETED,
+) -> Future[_T]:
     """
     等待一组任务完成
 
@@ -1619,8 +1658,8 @@ def wait(
 
 
 def wait_for(
-    aw: Union[Awaitable[Any], Generator[Future, Any, Any]], timeout: float
-) -> Future:
+        aw: Union[Awaitable[_T], Generator[Future[_T], Any, Any]], timeout: float
+) -> Future[_T]:
     """
     等待单个异步操作完成，带超时限制
 
@@ -1679,10 +1718,10 @@ def wait_for(
 
 
 def create_task(
-    aw: Union[Awaitable[Any], Generator[Future, Any, Any]], name: str = None
-) -> Task:
+        aw: Union[Awaitable[_T], Generator[Future[_T], Any, Any]], name: str = None
+) -> Task[_T]:
     """
-    创建一个 asyncio.Task 对象
+    创建一个 Task 对象
 
     Args:
         aw: 要包装的协程、生成器或 Future
@@ -1692,6 +1731,60 @@ def create_task(
     """
     loop = get_running_loop()
     return loop.create_task(aw, name=name)
+
+
+class TimeoutContext:
+    """
+    异步超时上下文管理器
+
+    用于为一段异步代码块提供超时保护。如果代码块执行时间超过指定值，
+    将抛出 TimeoutError。
+
+    Example:
+        >>> async with timeout(1.5):
+        ...     await slow_operation()
+    """
+    def __init__(self, delay: float) -> None:
+        """
+        初始化超时上下文
+
+        Args:
+            delay: 超时延迟时间（秒）
+        """
+        self._delay = delay
+        self._loop = get_running_loop()
+        self._timer: TimerHandle | None = None
+        self._task: Task | None = None
+        self._timed_out = False
+
+    async def __aenter__(self):
+        self._task = Task.current_task()
+        if not self._task:
+            raise RuntimeError("timeout() 必须在异步 Task 内部使用")
+
+        def on_timeout():
+            self._timed_out = True
+            self._task.cancel(msg=f"Timeout after {self._delay}s")
+
+        self._timer = self._loop.call_later(self._delay, on_timeout)
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self._timer:
+            self._timer.cancel()
+        if exc_type is CancelledError and self._timed_out:
+            raise TimeoutError() from exc_val
+
+
+def timeout(delay: float) -> TimeoutContext:
+    """
+    创建一个异步超时上下文管理器
+
+    Args:
+        delay: 超时秒数
+    Returns:
+        TimeoutContext: 上下文管理器实例
+    """
+    return TimeoutContext(delay)
 
 
 class AsyncSocket:
@@ -1805,3 +1898,371 @@ class AsyncSocket:
         self._sock.close()
         # self._loop.remove_reader(self._sock.fileno())
         # self._loop.remove_writer(self._sock.fileno())
+
+
+class QueueFullError(Exception):
+    pass
+
+
+class QueueEmptyError(Exception):
+    pass
+
+
+class Event:
+    """
+    异步事件实现
+
+    允许多个协程等待某个事件的发生。当事件被 set() 时，所有等待的协程都会被唤醒。
+    实现采用多 Future 模式，支持任务取消且互不干扰。
+    """
+
+    def __init__(self) -> None:
+        """初始化事件，默认为未设置状态"""
+        self._loop = get_running_loop()
+        self._waiters: deque[Future[None]] = deque()
+        self._is_set = False
+
+    def is_set(self) -> bool:
+        """如果事件已设置则返回 True"""
+        return self._is_set
+
+    def set(self) -> None:
+        """
+        设置事件，唤醒所有等待者
+        之后调用 wait() 的协程将不会阻塞。
+        """
+        if self.is_set():
+            return
+        self._is_set = True
+        while self._waiters:
+            f = self._waiters.popleft()
+            if not f.done():
+                f.set_result(None)
+
+    async def wait(self) -> bool:
+        """
+        等待事件被设置
+        如果事件已设置，则立即返回 True。
+        """
+        if self.is_set():
+            return True
+        f = self._loop.create_future()
+        self._waiters.append(f)
+        try:
+            await f
+            return True
+        finally:
+            try:
+                self._waiters.remove(f)
+            except ValueError:
+                pass
+
+    def clear(self) -> None:
+        """重置事件为未设置状态，之后调用 wait() 的协程将会阻塞"""
+        self._is_set = False
+
+
+class BaseAsyncLock:
+    """
+    异步线程安全锁基类
+    提供跨线程安全的操作事件循环的能力，是所有自定义异步锁的底层支撑。
+    """
+
+    __slots__ = ("_event", "_loop")
+
+    def __init__(self):
+        self._event = Event()
+        # 记录初始化时的事件循环，用于跨线程安全调度
+        self._loop = get_running_loop()
+        # 默认初始状态为放行
+        self._event.set()
+
+    def _safe_dispatch(self, action_name: str):
+        """通用跨线程安全调度器"""
+        current_loop = get_running_loop()
+
+        # 获取对应的 Event 方法 (set 或 clear)
+        action = getattr(self._event, action_name)
+        loop = self._loop
+        if loop and loop.is_running() and loop is not current_loop:
+            loop.call_soon_threadsafe(action)
+        else:
+            action()
+
+    def _wake_up(self):
+        """跨线程安全地唤醒所有等待者"""
+        self._safe_dispatch("set")
+
+    def _pause(self):
+        """跨线程安全地挂起所有等待者（进入锁定状态）"""
+        self._safe_dispatch("clear")
+
+    async def wait_unlock(self):
+        """异步挂起等待，直到计时归零或被强制解锁"""
+        await self._event.wait()
+
+    def is_locked(self) -> bool:
+        """检查当前是否处于锁定状态"""
+        return not self._event.is_set()
+
+
+class AsyncToggleLock(BaseAsyncLock):
+    """
+    异步开关锁：提供跨线程安全的“开启/关闭”控制信号。
+    适用于 Worker 暂停/恢复、系统开关等场景。
+    """
+
+    def activate(self):
+        """打开开关（放行状态）"""
+        self._wake_up()
+
+    def deactivate(self):
+        """关闭开关（阻塞状态）"""
+        self._pause()
+
+    async def wait_for_active(self):
+        """异步等待直到开关被打开"""
+        await self.wait_unlock()
+
+
+class AsyncCountdownLock(BaseAsyncLock):
+    """
+    通用异步计数解锁器 (Asyncio WaitGroup 模式)
+
+    在高并发异步环境下实现“多发一收”的计数屏障。类似于 Go 语言的 sync.WaitGroup，
+    支持同步加减计数，并提供异步等待点。
+
+    设计特性：
+    1. 极致性能：使用 __slots__ 优化内存，核心计数操作均为同步方法，避免协程调度开销。
+    2. 健壮性：内置超额释放(Double-Release)防御和自动状态纠正。
+    3. 追踪性：支持自动追踪 Task 生命周期，彻底防止死锁。
+    4. 灵活：支持上下文管理器(Context Manager)模式。
+    """
+
+    __slots__ = ("_unlock_count",)
+
+    def __init__(self):
+        """初始化计数器，默认计数为 0，初始状态为放行(Green Light)"""
+        super().__init__()
+        self._unlock_count = 0
+
+    def acquire(self):
+        """
+        同步增加计数(锁定)。
+        一旦计数大于 0，wait_unlock 会进入阻塞状态。
+        """
+        self._unlock_count += 1
+        if self._event.is_set():
+            self._pause()
+
+    def release(self):
+        """
+        同步减少计数(解锁)。
+        如果计数降至 0 或以下，将触发事件唤醒所有等待者。
+        """
+        self._unlock_count -= 1
+        if self._unlock_count <= 0:
+            self._unlock_count = 0
+            # 确保跨线程安全
+            self._wake_up()
+
+    def force_unlock(self):
+        """
+        【紧急动作】强制清零计数并解锁。
+        """
+        self._unlock_count = 0
+        self._wake_up()
+
+    def is_locked(self) -> bool:
+        """检查当前是否有任务正在运行(红灯状态)"""
+        return not self._event.is_set()
+
+    @property
+    def lock_count(self) -> int:
+        """获取当前正在锁定的任务数量"""
+        return self._unlock_count
+
+    def __enter__(self):
+        """支持 context manager 同步锁定进入"""
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """支持 context manager 同步锁定退出，即便发生异常也能确保释放"""
+        self.release()
+
+    def trace_task(self, task: Task) -> bool:
+        """
+        自动追踪一个异步 Task。
+        通过 add_done_callback 机制，在 Task 结束(成功/失败/取消)时自动 release。
+
+        Args:
+            task: 需要被追踪的 Task 对象
+
+        Returns:
+            bool: 如果任务尚未完成并成功挂载回调返回 True，否则返回 False
+        """
+        if task.done():
+            return False
+        self.acquire()
+        task.add_done_callback(lambda _: self.release())
+        return True
+
+
+class AsyncQueue(Generic[_T]):
+    """
+    异步队列实现
+
+    支持并发的生产者和消费者，提供可选的容量限制。
+    当队列满时，put 操作会阻塞；当队列空时，get 操作会阻塞。
+
+    Attributes:
+        _items: 存储队列元素的 deque
+        _getters: 等待 get 操作的 Future 队列
+        _putters: 等待 put 操作的 (item, Future) 队列
+        _maxsize: 队列最大容量，0 表示无限
+    """
+
+    def __init__(self, maxsize: int = 0) -> None:
+        """
+        初始化异步队列
+
+        Args:
+            maxsize: 队列最大容量，0 表示不设限制
+        """
+        self._loop = get_running_loop()
+        self._items: deque[_T] = deque()
+        self._getters: deque[Future[_T]] = deque()
+        self._putters: deque[Tuple[_T, Future[None]]] = deque()
+        self._maxsize = maxsize
+        self._unfinished_tasks = AsyncCountdownLock()
+
+    def qsize(self) -> int:
+        """返回队列中的元素数量"""
+        return len(self._items)
+
+    def empty(self) -> bool:
+        """如果队列为空则返回 True"""
+        return not self._items
+
+    def full(self) -> bool:
+        """如果队列已满则返回 True"""
+        return 0 < self._maxsize <= len(self._items)
+
+    def _wake_getter(self, item: _T) -> bool:
+        """
+        唤醒等待 get 操作的 Future
+        循环查找非完成的 getter，设置其结果为 item 并返回 True。
+        如果所有 getter 都已完成（如被取消），返回 False。
+        """
+        while self._getters:
+            getter = self._getters.popleft()
+            if not getter.done():
+                getter.set_result(item)
+                return True
+        return False
+
+    async def put(self, item: _T) -> None:
+        """
+        向队列中添加一个元素
+
+        如果队列已满，则等待直到有可用空间。
+
+        Args:
+            item: 要添加的元素
+        """
+        if self._wake_getter(item):
+            self._unfinished_tasks.acquire()
+            return
+        if not self.full():
+            self._items.append(item)
+            self._unfinished_tasks.acquire()
+            return
+        fut = self._loop.create_future()
+        self._putters.append((item, fut))
+        await fut
+        self._unfinished_tasks.acquire()
+
+    def put_nowait(self, item: _T) -> None:
+        """
+        非阻塞地向队列添加元素
+
+        Args:
+            item: 要添加的元素
+
+        Raises:
+            QueueFullError: 如果队列已满
+        """
+        if self._wake_getter(item):
+            self._unfinished_tasks.acquire()
+            return
+
+        if self.full():
+            raise QueueFullError("Queue full")
+
+        self._items.append(item)
+        self._unfinished_tasks.acquire()
+
+    async def get(self) -> _T:
+        """
+        从队列中获取一个元素
+
+        如果队列为空，则等待直到有元素可用。
+
+        Returns:
+            _T: 获取到的元素
+        """
+        if self._items:
+            item = self._items.popleft()
+            self._wake_putter()
+            return item
+        fut = self._loop.create_future()
+        self._getters.append(fut)
+        return await fut
+
+    def get_nowait(self) -> _T:
+        """
+        非阻塞地从队列获取元素
+
+        Returns:
+            _T: 获取到的元素
+
+        Raises:
+            QueueEmptyError: 如果队列为空
+        """
+        if not self._items:
+            raise QueueEmptyError("Queue empty")
+
+        item = self._items.popleft()
+        self._wake_putter()
+        return item
+
+    def task_done(self) -> None:
+        """
+        通知队列之前排队的任务已完成
+        由消费者在处理完任务后调用。
+        """
+        self._unfinished_tasks.release()
+
+    async def join(self) -> None:
+        """
+        阻塞直到队列中所有任务都被处理完成
+        即所有 put() 进来的任务都调用了对应的 task_done()。
+        """
+        await self._unfinished_tasks.wait_unlock()
+
+    def _wake_putter(self):
+        """
+        唤醒等待 put 操作的 Future
+        循环查找非完成的 putter，将其 item 放入队列或直接交给等待的 getter。
+        """
+        while self._putters:
+            item, fut = self._putters.popleft()
+            if fut.done():
+                continue
+
+            if not self._wake_getter(item):
+                self._items.append(item)
+
+            fut.set_result(None)
+            break
