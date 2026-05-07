@@ -274,6 +274,58 @@ loop.add_reader(sock, on_read, one_shot=True)
 如果希望在回调内继续监听，请在回调结束时重新调用 `add_reader` 或使用持久回调（默认行为）。
 
 
+### 线程安全的 I/O 注册与按回调移除
+
+库提供了对 I/O 回调更细粒度的控制：
+
+- **线程安全注册**：`add_reader_threadsafe(fileobj, callback, *args, one_shot=False)` 和 `add_writer_threadsafe(...)`。
+  这些方法可以在非事件循环线程中安全调用。它们内部会使用 `call_soon_threadsafe` 将实际注册调度到事件循环线程并唤醒循环。
+
+示例：
+
+```python
+import threading
+from simple_asyncio import get_event_loop
+
+loop = get_event_loop()
+
+def cb(fut):
+    fut.set_result('ok')
+
+f = loop.create_future()
+
+def worker():
+    # 在另一个线程中注册可读回调（安全）
+    loop.add_reader_threadsafe(sock, cb, f)
+
+threading.Thread(target=worker).start()
+res = loop.run(f)
+```
+
+- **按回调移除**：如果你在同一文件描述符上注册了多个回调，可以使用 `remove_reader_callback(fileobj, callback)` 或 `remove_writer_callback(fileobj, callback)` 精确移除指定回调（按回调函数对象匹配，非线程安全）。对应的线程安全版本为 `remove_reader_callback_threadsafe(...)` 和 `remove_writer_callback_threadsafe(...)`，它们会将移除操作调度回事件循环线程。
+
+示例：
+
+```python
+def on_read_a():
+    print('A')
+
+def on_read_b():
+    print('B')
+
+loop.add_reader(sock, on_read_a)
+loop.add_reader(sock, on_read_b)
+
+# 仅移除 on_read_a
+loop.remove_reader_callback(sock, on_read_a)
+```
+
+注意事项：
+
+- `remove_*_callback` 默认按函数对象 (`is`) 匹配并移除所有相同函数的条目；如果你需要按参数精确匹配，可在回调封装时保存引用或请求库支持按 `(callback, args)` 匹配。
+- 线程安全方法是通过将操作调度回事件循环线程实现的，因此它们返回时不保证已立即生效：若需要确认已注册/移除，可将操作与一个 Future/事件配合使用。
+
+
 ---
 
 ## 🎯 高级特性
