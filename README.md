@@ -250,6 +250,30 @@ async def tcp_client():
 run(tcp_client())
 ```
 
+### 注册 I/O 回调（`add_reader` / `add_writer`）
+
+`EventLoop` 的 I/O 注册支持在同一文件描述符上同时注册多个读/写回调，并区分一次性（one-shot）与持久回调。
+
+- `one_shot=False`（默认）: 回调在事件发生后保持注册，除非回调内部或外部调用 `remove_reader`/`remove_writer`。
+- `one_shot=True`: 回调在首次触发后自动移除（一次性回调）。
+
+示例：一次性读回调
+
+```python
+from simple_asyncio import get_event_loop
+
+def on_read():
+    data = sock.recv(1024)
+    print('收到数据:', data)
+
+loop = get_event_loop()
+# 注册一次性读回调（只在下一次可读时触发）
+loop.add_reader(sock, on_read, one_shot=True)
+```
+
+如果希望在回调内继续监听，请在回调结束时重新调用 `add_reader` 或使用持久回调（默认行为）。
+
+
 ---
 
 ## 🎯 高级特性

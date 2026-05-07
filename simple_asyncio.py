@@ -676,9 +676,11 @@ class EventLoop:
         self._self_reader.setblocking(False)
         self._self_writer.setblocking(False)
 
-        # 将读端注册到 selector，回调用于“消费”唤醒信号
+        # 使用统一的数据结构存储 read/write 回调列表，便于支持持久/一次性回调
         self._selector.register(
-            self._self_reader.fileno(), selectors.EVENT_READ, (self._consume_wake, ())
+            self._self_reader.fileno(),
+            selectors.EVENT_READ,
+            {"read": [(self._consume_wake, (), False)], "write": []},
         )
 
     def is_closed(self) -> bool:
@@ -743,7 +745,8 @@ class EventLoop:
         Thread Safety:
             此方法是线程安全的，可以从任何线程调用。
         """
-        self.call_soon(callback, *args)
+        with self._ready_lock:
+            self.call_soon(callback, *args)
         self._wake_loop()
 
     def _wake_loop(self) -> None:
@@ -861,8 +864,7 @@ class EventLoop:
         Note:
             此方法不是线程安全的。从其他线程调用应使用 call_soon_threadsafe。
         """
-        with self._ready_lock:
-            self._ready.append((callback, args))
+        self._ready.append((callback, args))
 
     def call_later(
         self, delay: float, callback: Callable[..., Any], *args: Any
@@ -891,7 +893,11 @@ class EventLoop:
         return handler
 
     def add_reader(
-        self, fileobj: int, callback: Callable[..., Any], *args: Any
+        self,
+        fileobj: int,
+        callback: Callable[..., Any],
+        *args: Any,
+        one_shot: bool = False,
     ) -> None:
         """
         注册文件描述符的可读事件
@@ -900,15 +906,16 @@ class EventLoop:
             fileobj: 文件描述符或 socket
             callback: 可读时执行的回调
             *args: 回调参数
+            one_shot: 是否仅执行一次（默认 False）
         """
-        try:
-            self._selector.unregister(fileobj)
-        except KeyError:
-            pass
-        self._selector.register(fileobj, selectors.EVENT_READ, (callback, args))
+        self._add_io_callback("read", fileobj, callback, args, one_shot)
 
     def add_writer(
-        self, fileobj: int, callback: Callable[..., Any], *args: Any
+        self,
+        fileobj: int,
+        callback: Callable[..., Any],
+        *args: Any,
+        one_shot: bool = False,
     ) -> None:
         """
         注册文件描述符的可写事件
@@ -917,12 +924,9 @@ class EventLoop:
             fileobj: 文件描述符或 socket
             callback: 可写时执行的回调
             *args: 回调参数
+            one_shot: 是否仅执行一次（默认 False）
         """
-        try:
-            self._selector.unregister(fileobj)
-        except KeyError:
-            pass
-        self._selector.register(fileobj, selectors.EVENT_WRITE, (callback, args))
+        self._add_io_callback("write", fileobj, callback, args, one_shot)
 
     def remove_reader(self, fileobj: int) -> None:
         """
@@ -931,10 +935,7 @@ class EventLoop:
         Args:
             fileobj: 文件描述符或 socket
         """
-        try:
-            self._selector.unregister(fileobj)
-        except KeyError:
-            pass  # 已经移除
+        self._remove_io_callbacks("read", fileobj)
 
     def remove_writer(self, fileobj: int) -> None:
         """
@@ -943,10 +944,137 @@ class EventLoop:
         Args:
             fileobj: 文件描述符或 socket
         """
+        self._remove_io_callbacks("write", fileobj)
+
+    def _fd(self, fileobj: int) -> int:
+        """返回文件描述符整数。"""
+        return fileobj if isinstance(fileobj, int) else fileobj.fileno()
+
+    def _add_io_callback(
+        self,
+        direction: str,
+        fileobj: int,
+        callback: Callable[..., Any],
+        args: Tuple[Any, ...],
+        one_shot: bool,
+    ) -> None:
+        """内部：向 selector 的 direction 列表添加回调并更新注册。"""
+        fd = self._fd(fileobj)
+        event = selectors.EVENT_READ if direction == "read" else selectors.EVENT_WRITE
         try:
-            self._selector.unregister(fileobj)
+            key = self._selector.get_key(fd)
         except KeyError:
-            pass  # 已经移除
+            data = {"read": [], "write": []}
+            data[direction].append((callback, args, one_shot))
+            self._selector.register(fd, event, data)
+        else:
+            data = key.data
+            data.setdefault(direction, []).append((callback, args, one_shot))
+            events = key.events | event
+            self._selector.modify(fd, events, data)
+
+    def _update_selector_registration(self, fd: int, data: dict) -> None:
+        """内部：根据 data['read']/['write'] 的内容，修改或注销 selector 的注册。
+
+        如果两个方向都没有回调则注销，否则根据存在的方向设置事件掩码。
+        在高并发场景中可能遇到 KeyError，统一忽略该异常。
+        """
+        new_events = 0
+        if data.get("read"):
+            new_events |= selectors.EVENT_READ
+        if data.get("write"):
+            new_events |= selectors.EVENT_WRITE
+
+        try:
+            if new_events:
+                self._selector.modify(fd, new_events, data)
+            else:
+                try:
+                    self._selector.unregister(fd)
+                except KeyError:
+                    pass
+        except KeyError:
+            # 在高并发下，fd 可能已被移除，忽略即可
+            pass
+
+    def _remove_io_callbacks(self, direction: str, fileobj: int) -> None:
+        """内部：清空 direction 的回调并根据剩余回调修改或注销 selector 注册。"""
+        fd = self._fd(fileobj)
+        try:
+            key = self._selector.get_key(fd)
+        except KeyError:
+            return
+        data = key.data
+        data[direction] = []
+        self._update_selector_registration(fd, data)
+
+    def _remove_specific_io_callback(
+        self, direction: str, fileobj: int, callback: Callable[..., Any]
+    ) -> None:
+        """内部：从 direction 列表中移除指定回调（按函数对象匹配）。"""
+        fd = self._fd(fileobj)
+        try:
+            key = self._selector.get_key(fd)
+        except KeyError:
+            return
+        data = key.data
+        lst = data.get(direction, [])
+        # 移除所有与 callback 相同的回调条目
+        data[direction] = [item for item in lst if item[0] is not callback]
+        self._update_selector_registration(fd, data)
+
+    def add_reader_threadsafe(
+        self,
+        fileobj: int,
+        callback: Callable[..., Any],
+        *args: Any,
+        one_shot: bool = False,
+    ) -> None:
+        """线程安全地注册可读回调（可从其他线程调用）。"""
+        # 使用 call_soon_threadsafe 在事件循环线程中执行实际注册
+        self.call_soon_threadsafe(
+            self._add_io_callback, "read", fileobj, callback, args, one_shot
+        )
+
+    def add_writer_threadsafe(
+        self,
+        fileobj: int,
+        callback: Callable[..., Any],
+        *args: Any,
+        one_shot: bool = False,
+    ) -> None:
+        """线程安全地注册可写回调（可从其他线程调用）。"""
+        self.call_soon_threadsafe(
+            self._add_io_callback, "write", fileobj, callback, args, one_shot
+        )
+
+    def remove_reader_callback(
+        self, fileobj: int, callback: Callable[..., Any]
+    ) -> None:
+        """从 `fileobj` 的可读回调列表中移除指定回调（非线程安全）。"""
+        self._remove_specific_io_callback("read", fileobj, callback)
+
+    def remove_reader_callback_threadsafe(
+        self, fileobj: int, callback: Callable[..., Any]
+    ) -> None:
+        """线程安全地从 `fileobj` 的可读回调列表中移除指定回调。"""
+        self.call_soon_threadsafe(
+            self._remove_specific_io_callback, "read", fileobj, callback
+        )
+
+    def remove_writer_callback(
+        self, fileobj: int, callback: Callable[..., Any]
+    ) -> None:
+        """从 `fileobj` 的可写回调列表中移除指定回调（非线程安全）。"""
+        self._remove_specific_io_callback("write", fileobj, callback)
+
+    def remove_writer_callback_threadsafe(
+        self, fileobj: int, callback: Callable[..., Any]
+    ) -> None:
+        """线程安全地从 `fileobj` 的可写回调列表中移除指定回调。"""
+        self.call_soon_threadsafe(
+            self._remove_specific_io_callback, "write", fileobj, callback
+        )
 
     def create_task(
         self,
@@ -995,6 +1123,33 @@ class EventLoop:
             Future: 与当前事件循环关联的 Future 对象
         """
         return Future(self)
+
+    def gather(
+        self, *coro_s: Union[Awaitable[Any], Generator[Future, Any, Any], Task]
+    ) -> Future:
+        """
+        便捷方法：调用模块级 `gather`。
+        """
+        return gather(*coro_s)
+
+    def wait(
+        self,
+        fs: List[Union[Awaitable[Any], Generator[Future, Any, Any], Task]],
+        timeout: Optional[float] = None,
+        return_when: str = ALL_COMPLETED,
+    ) -> Future:
+        """
+        便捷方法：调用模块级 `wait`。
+        """
+        return wait(fs, timeout=timeout, return_when=return_when)
+
+    def wait_for(
+        self, aw: Union[Awaitable[Any], Generator[Future, Any, Any]], timeout: float
+    ) -> Future:
+        """
+        便捷方法：调用模块级 `wait_for`。
+        """
+        return wait_for(aw, timeout=timeout)
 
     def run(self, awaitable: Union[Generator[Future, Any, Any], Task, Future]) -> Any:
         """
@@ -1050,6 +1205,55 @@ class EventLoop:
             }
             self.call_exception_handler(context)
 
+    def _dispatch_selector_event(self, key, mask) -> None:
+        """
+        将 selector 事件的分发逻辑提取出来，统一处理 read/write 列表中的回调。
+
+        参数:
+            key: selector 返回的 key 对象
+            mask: 事件掩码
+
+        行为:
+            - 对 read/write 两个方向分别处理回调列表
+            - 调用回调时使用 `call_soon`
+            - 移除标记为一次性（one_shot）的回调
+            - 根据剩余回调更新 selector 的注册（modify/unregister）
+        """
+        data = key.data
+        fd = key.fileobj
+
+        for direction, event_flag in (
+            ("read", selectors.EVENT_READ),
+            ("write", selectors.EVENT_WRITE),
+        ):
+            if not (mask & event_flag):
+                continue
+
+            # 复制列表以便在回调过程中安全遍历/修改原始列表
+            callback_list = list(data.get(direction, []))
+            for item in callback_list:
+                cb, args, one_shot = item
+                try:
+                    self.call_soon(cb, *args)
+                except Exception:
+                    # call_soon 本身不应抛，但捕获以防止影响其它回调
+                    context = {
+                        "message": "Exception scheduling callback",
+                        "exception": None,
+                        "callback": cb,
+                        "args": args,
+                    }
+                    self.call_exception_handler(context)
+
+                if one_shot:
+                    try:
+                        data[direction].remove(item)
+                    except ValueError:
+                        pass
+
+        # 更新 selector 注册（封装以避免重复代码）
+        self._update_selector_registration(fd, data)
+
     def _run_once(self, main_task: Task):
         while self._running:
             # 核心退出条件：如果主任务已完成，且没有其他后台任务正在运行（常用于清理阶段）
@@ -1073,9 +1277,17 @@ class EventLoop:
             # 获取selector的事件列表
             events = self._selector.select(timeout)
             for key, mask in events:
-                cb, args = key.data
-                self.call_soon(cb, *args)
-                self._selector.unregister(key.fileobj)
+                # 将事件处理委托到单独方法，减少重复并提高可测性
+                try:
+                    self._dispatch_selector_event(key, mask)
+                except Exception as e:
+                    context = {
+                        "message": "Exception while dispatching selector event",
+                        "exception": e,
+                        "key": key,
+                        "mask": mask,
+                    }
+                    self.call_exception_handler(context)
             # 4. 执行所有就绪队列里的回调
             # 限制执行当前长度的任务，避免 call_soon 导致的无限忙轮询
             with self._ready_lock:
@@ -1262,11 +1474,16 @@ def gather(*coro_s: Union[Awaitable[Any], Generator[Future, Any, Any], Task]) ->
     completed_count = 0
     failed = False
     tasks = []
+    task_to_index = {}
 
-    def _on_task_done(idx: int, task_f: Future):
+    def _on_task_done(task_f: Future):
         nonlocal completed_count, failed
 
         if failed:  # 如果已经有一个任务失败了，忽略其他的
+            return
+
+        idx = task_to_index.pop(task_f, None)
+        if idx is None:
             return
 
         try:
@@ -1299,8 +1516,9 @@ def gather(*coro_s: Union[Awaitable[Any], Generator[Future, Any, Any], Task]) ->
         # 启动协程任务（支持生成器协程和原生协程）
         if isinstance(task, (GeneratorType, CoroutineType)):
             task = loop.create_task(coro)
-        # 绑定回调。注意使用闭包捕获当前的索引 i
-        task.add_done_callback(lambda tf, idx=i: _on_task_done(idx, tf))
+        # 绑定共享回调，避免为每个任务创建 lambda 闭包。
+        task_to_index[task] = i
+        task.add_done_callback(_on_task_done)
         tasks.append(task)
     all_done_future.add_done_callback(_propagate_cancel)
     return all_done_future
@@ -1451,8 +1669,8 @@ def wait_for(
     timeout_handle = loop.call_later(timeout, _on_timeout)
 
     # 如果任务提前完成，取消定时器
-    def cancel_timeout(fut):
-        if not timeout_handle.cancelled():
+    def cancel_timeout(fut: Future):
+        if fut.done() and not timeout_handle.cancelled():
             timeout_handle.cancel()
 
     done_future.add_done_callback(cancel_timeout)
