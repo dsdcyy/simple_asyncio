@@ -20,6 +20,7 @@ Created: 2026/5/4
 import contextvars
 import errno
 import heapq
+import logging
 import os
 import selectors
 import socket
@@ -28,6 +29,7 @@ import time
 import weakref
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, Future as ThreadFuture
+from contextlib import contextmanager
 from contextvars import ContextVar
 from types import GeneratorType, CoroutineType
 from typing import (
@@ -43,7 +45,30 @@ from typing import (
     TypeVar,
     Generic,
 )
-
+__all__ = (
+    "EventLoop",
+    "Task",
+    "Future",
+    "TimerHandle",
+    "AsyncSocket",
+    "sleep",
+    "gather",
+    "wait",
+    "wait_for",
+    "run",
+    "get_event_loop",
+    "get_running_loop",
+    "Event",
+    "AsyncQueue",
+    "AsyncCountdownLock",
+    "AsyncSelectiveLock",
+    "AsyncToggleLock",
+    "get_running_loop_safe",
+    "CancelledError",
+    "TimeoutError",
+    "yield_control",
+)
+logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 # 使用 ContextVar 存储当前事件循环（线程安全、协程安全）
 _loop_var: ContextVar[Optional["EventLoop"]] = ContextVar("_loop", default=None)
@@ -1236,20 +1261,27 @@ class EventLoop:
             self._run_once(main_task)
         return main_task.result()
 
-    def _complete_a_task(self):
+    def _report_error(self, message: str, exc: Optional[Exception], **kwargs) -> None:
+        """
+        统一的异常报告入口，构建上下文并调用异常处理器。
 
-        cb, args = self._ready.popleft()
+        Args:
+            message: 错误描述消息
+            exc: 捕获到的异常对象
+            **kwargs: 额外的上下文信息（如 callback, fd, task 等）
+        """
+        context = {
+            "message": message,
+            "exception": exc,
+        }
+        context.update(kwargs)
+        self.call_exception_handler(context)
+
+    def _complete_a_task(self, cb, *args):
         try:
             cb(*args)
         except Exception as e:
-            # 构建上下文信息
-            context = {
-                "message": "Exception in callback",
-                "exception": e,
-                "callback": cb,
-                "args": args,
-            }
-            self.call_exception_handler(context)
+            self._report_error("Exception in callback", e, callback=cb, args=args)
 
     def _dispatch_selector_event(self, key, mask) -> None:
         """
@@ -1281,15 +1313,11 @@ class EventLoop:
                 cb, args, one_shot = item
                 try:
                     self.call_soon(cb, *args)
-                except Exception:
+                except Exception as e:
                     # call_soon 本身不应抛，但捕获以防止影响其它回调
-                    context = {
-                        "message": "Exception scheduling callback",
-                        "exception": None,
-                        "callback": cb,
-                        "args": args,
-                    }
-                    self.call_exception_handler(context)
+                    self._report_error(
+                        "Exception scheduling callback", e, callback=cb, args=args
+                    )
 
                 if one_shot:
                     try:
@@ -1302,8 +1330,8 @@ class EventLoop:
 
     def _run_once(self, main_task: Task):
         while self._running:
-            # 核心退出条件：如果主任务已完成，且没有其他后台任务正在运行（常用于清理阶段）
-            if main_task.done() and not self._tasks:
+            # 核心退出条件：如果主任务已完成，且没有其他后台任务正在运行、没有就绪队列里的任务（常用于清理阶段）
+            if main_task.done() and not self._tasks and not self._ready:
                 break
 
             # 1. 获取当前时间戳（每一轮循环开始时更新）
@@ -1331,13 +1359,12 @@ class EventLoop:
                 try:
                     self._dispatch_selector_event(key, mask)
                 except Exception as e:
-                    context = {
-                        "message": "Exception while dispatching selector event",
-                        "exception": e,
-                        "key": key,
-                        "mask": mask,
-                    }
-                    self.call_exception_handler(context)
+                    self._report_error(
+                        "Exception while dispatching selector event",
+                        e,
+                        key=key,
+                        mask=mask,
+                    )
             # 4. 执行所有就绪队列里的回调
             # 限制执行当前长度的任务，避免 call_soon 导致的无限忙轮询
             with self._ready_lock:
@@ -1346,7 +1373,8 @@ class EventLoop:
                 with self._ready_lock:
                     if not self._ready:
                         break
-                self._complete_a_task()
+                    cb, args = self._ready.popleft()
+                self._complete_a_task(cb, *args)
 
             # 5. 决定是继续干活还是休息
             # 如果已经停止运行（如主任务已完成），或者还有就绪任务，则不再进入休眠
@@ -1583,7 +1611,7 @@ def wait(
     fs: List[Union[Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T]]],
     timeout: Optional[float] = None,
     return_when: str = ALL_COMPLETED,
-) -> Future[_T]:
+) -> Future[Tuple[Set[Task], Set[Task]]]:
     """
     等待一组任务完成
 
@@ -1921,6 +1949,7 @@ class QueueFullError(Exception):
     """
     队列已满异常
     """
+
     pass
 
 
@@ -1928,6 +1957,7 @@ class QueueEmptyError(Exception):
     """
     队列为空异常
     """
+
     pass
 
 
@@ -2289,3 +2319,239 @@ class AsyncQueue(Generic[_T]):
 
             fut.set_result(None)
             break
+
+
+class SelectiveLockBase(BaseAsyncLock):
+    """
+    选择性锁基类：提供基于自增 ID 的局部等待机制。
+
+    封装 _waiters 队列管理、ID 自增分配及核心等待逻辑，
+    子类须实现 _is_any_active(target_ids) 以定义"活跃"语义。
+    """
+
+    __slots__ = ("_waiters", "_id_counter")
+
+    def __init__(self):
+        super().__init__()
+        self._id_counter: int = 0
+        self._waiters: list[tuple[set[int], Future[None]]] = []
+
+    def _next_id(self) -> int:
+        """分配下一个唯一 ID"""
+        self._id_counter += 1
+        return self._id_counter
+
+    def _is_any_active(self, target_ids: set[int]) -> bool:
+        """检查目标 ID 中是否还有活跃的（子类实现）"""
+        raise NotImplementedError
+
+    def _trigger_waiters_check(self):
+        """触发所有局部等待者的状态检查"""
+        if not self._waiters:
+            return
+        
+        remaining = []
+        for target_ids, fut in self._waiters:
+            if not self._is_any_active(target_ids):
+                if not fut.done():
+                    fut.set_result(None)
+            else:
+                remaining.append((target_ids, fut))
+        self._waiters = remaining
+
+    async def _wait_for_ids(self, target_set: set[int]) -> None:
+        """
+        核心等待逻辑（供子类 wait_unlock 调用）。
+        - target_set 为空：全局屏障，等待所有任务完成。
+        - target_set 非空：局部屏障，等待指定 ID 全部不活跃。
+        """
+        if not target_set:
+            await self._event.wait()
+            return
+        if not self._is_any_active(target_set):
+            return
+        fut = get_running_loop().create_future()
+        self._waiters.append((target_set, fut))
+        await fut
+
+    async def _on_force(self, target_set: set[int]) -> None:
+        """超时强制清理钩子（子类实现）"""
+        raise NotImplementedError
+
+    async def wait_unlock(
+        self,
+        target_ids: Union[list[int], set[int], None] = None,
+        duration: Optional[float] = None,
+        force: bool = False,
+    ):
+        """
+        等待解锁。
+        Args:
+        - target_ids=None: 全局屏障，等待所有 ID 完成。
+        - target_ids=[...]: 局部屏障，只要指定 ID 完成即放行。
+        - duration: 超时等待时间（秒）。
+        - force: 若超时，是否调用 _on_force 执行强制清理。
+        """
+        target_set = set(target_ids) if target_ids is not None else set()
+        if duration is not None:
+            try:
+                async with timeout(duration):
+                    await self._wait_for_ids(target_set)
+            except TimeoutError:
+                if force:
+                    try:
+                        await self._on_force(target_set)
+                    except Exception as e:
+                        logging.error(
+                            f"{self.__class__.__name__}: Error during force action: {e}"
+                        )
+                raise
+        else:
+            await self._wait_for_ids(target_set)
+
+    def acquire(self, task_identifier: Any) -> int:
+        """
+        一个任务标识符，可自动分配或指定一个。标识锁定了一段事务，可以是任务或代码块。
+        Returns:
+            int: 分配给该 task_identifier 的唯一 tid，用于后续 release/wait_unlock
+        """
+        tid = self._next_id()
+        if self._event.is_set():
+            self._pause()
+        return tid
+
+    def release(self, tid: int):
+        """释放指定 tid 的锁"""
+        raise NotImplemented
+
+    def trace_task(self, task: Task) -> int:
+        """
+        追踪 Task 生命周期：自动加锁，任务结束时自动 release。
+        Returns:
+            int: 分配给该 Task 的唯一 tid
+        """
+
+        tid = self.acquire(task)
+        task.add_done_callback(lambda _: self.release(tid))
+        return tid
+
+
+class AsyncSelectiveLock(SelectiveLockBase):
+    """
+    高级异步策略锁-支持细粒度局部解锁
+
+    基于 ID 追踪机制，允许协程等待一组并行任务中的“特定子集”完成，而无需等待全部任务结束。
+    兼顾了全量等待(Barrier)和局部等待(Partial Wait)的能力。
+    """
+
+    # 协程私有口袋：存储当前上下文中领到的 ID，确保 with 语法下的 ID 传递安全
+    _current_tid: ContextVar[Optional[int]] = ContextVar("_current_tid", default=None)
+
+    def __enter__(self) -> int:
+        """支持 with lock: 语法，自动领票并存入口袋"""
+        tid = self.acquire()
+        self._current_tid.set(tid)
+        return tid
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """支持 with lock: 语法，自动从口袋摸票并销账"""
+        tid = self._current_tid.get()
+        if tid is not None:
+            self.release(tid)
+            self._current_tid.set(None)
+
+    async def __aenter__(self) -> int:
+        """支持 async with lock: 语法"""
+        return self.__enter__()
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """支持 async with lock: 语法"""
+        return self.__exit__(exc_type, exc_val, exc_tb)
+
+    @contextmanager
+    def hold(self, task_id: Optional[int] = None):
+        """显式上下文管理器：with lock.hold(id) as tid:"""
+        tid = self.acquire(task_id)
+        try:
+            yield tid
+        finally:
+            self.release(tid)
+
+    __slots__ = ("_active_ids",)
+
+    def __init__(self):
+        super().__init__()
+        self._active_ids: set[int] = set()
+
+    def _is_any_active(self, target_ids: set[int]) -> bool:
+        return bool(target_ids & self._active_ids)
+
+    def acquire(self, task_id: Optional[int] = None) -> int:
+        """增加一个带标识的锁定任务，若未提供 task_id 则生成并返回一个自增 ID"""
+        if task_id is None:
+            task_id = self._next_id()
+        
+        if task_id in self._active_ids:
+            return task_id
+
+        self._active_ids.add(task_id)
+        if self._event.is_set():
+            self._pause()
+        return task_id
+
+    def release(self, task_id: int):
+        """释放指定标识的任务，并驱动唤醒相关的局部等待者"""
+        if task_id not in self._active_ids:
+            return
+
+        self._active_ids.discard(task_id)
+
+        # 1. 局部解锁逻辑：检查是否有等待特定 ID 集合的协程
+        self._trigger_waiters_check()
+
+        # 2. 全局解锁逻辑
+        if not self._active_ids:
+            self._wake_up()
+
+    def trace_task(self, task: Task) -> int:
+        """追踪 Task 对象生命周期并返回其唯一追踪 ID"""
+        tid = self.acquire()
+        task.add_done_callback(lambda _: self.release(tid))
+        return tid
+
+    async def _on_force(self, target_set: set[int]) -> None:
+        """超时时强制解锁：从活跃集中移除目标 ID。"""
+        self.force_unlock(target_set if target_set else None)
+
+    def force_unlock(self, target_ids: Union[list[int], set[int], None] = None):
+        """
+        强制解锁：
+        - target_ids=None: 灾难恢复，全量清空所有状态并放行。
+        - target_ids=[...]: 局部强拆。将指定的 ID 强行移出活跃集，并同步驱动等待者检查。
+        """
+        if target_ids is None:
+            self._active_ids.clear()
+            for _, fut in self._waiters:
+                if not fut.done():
+                    fut.set_result(None)
+            self._waiters.clear()
+            self._wake_up()
+        else:
+            target_set = set(target_ids)
+            changed = False
+            for tid in target_set:
+                if tid in self._active_ids:
+                    self._active_ids.discard(tid)
+                    changed = True
+
+            if changed:
+                self._trigger_waiters_check()
+
+            if not self._active_ids:
+                self._wake_up()
+
+    def is_locked(self, task_id: Optional[int] = None) -> bool:
+        """检查状态：若指定 id 则检查特定任务，否则检查全局锁"""
+        if task_id is not None:
+            return task_id in self._active_ids
+        return bool(self._active_ids)
