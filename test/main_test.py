@@ -49,11 +49,11 @@ def main2():
         # print(f"task{task_id} 睡醒")
         return f"done{task_id}"
 
-    tasks = [test_task(i, 0.1) for i in range(10000)]
+    tasks = [test_task(i, 0.1) for i in range(100000)]
     all_done_future = gather(*tasks)
     # print((yield all_done_future))
     res = yield all_done_future
-    print("全部结束")
+    # print("全部结束", res)
     return None
 
 
@@ -192,9 +192,24 @@ def main7():
     asyncio.run(asyncio_test())
 
 
+async def main8():
+    async def test_task(task_id, delay):
+        # print(f"task{task_id} 开始")
+        await sleep(delay)
+        # print(f"task{task_id} 睡醒")
+        return f"done{task_id}"
+
+    tasks = [test_task(i, 0.1) for i in range(10000)]
+    all_done_future = gather(*tasks)
+    # print((await all_done_future))
+    res = await all_done_future
+    # print("全部结束", res)
+    return res
+
+
 if __name__ == "__main__":
     start_time = time.time()
-    run(main2())  # 框架测试
+    run(main8())  # 框架测试
     print("总耗时：", time.time() - start_time)
 
     # run(main4())  # HTTP 请求测试

@@ -1610,60 +1610,49 @@ def gather(
         >>> print(results)  # ["result1", "result2"]
     """
     loop = get_running_loop()
-    all_done_future = loop.create_future()
-
+    all_done = loop.create_future()
     if not coro_s:
-        all_done_future.set_result([])
-        return all_done_future
+        all_done.set_result([])
+        return all_done
 
-    results = [None] * len(coro_s)
-    completed_count = 0
+    n = len(coro_s)
+    results = [None] * n
+    completed = 0
     failed = False
-    tasks: List[Task | None] = [None] * len(coro_s)
-    task_to_index = {}
+    tasks: dict[Task, int] = {}
 
-    def _on_task_done(task_f: Future):
-        nonlocal completed_count, failed
-
-        if failed:  # 如果已经有一个任务失败了，忽略其他的
+    def on_task_done(t: Task):
+        nonlocal completed, failed
+        if failed:
             return
-
-        idx = task_to_index.pop(task_f, None)
-        if idx is None:
+        idx = tasks.pop(t, None)
+        if idx is None:  # 理论上不应发生，但防御
             return
-
         try:
-            # 尝试获取结果，如果任务抛异常了，这里会直接 raise
-            results[idx] = task_f.result()
-            completed_count += 1
-
-            # 如果全部任务都顺利完成了
-            if completed_count == len(coro_s):
-                all_done_future.set_result(results)
-
+            results[idx] = t.result()
+            completed += 1
+            if completed == n:
+                all_done.set_result(results)
         except Exception as e:
-            # 只要有一个任务失败，gather 整体就宣告失败
             failed = True
-            for _task in tasks:
-                if _task and not _task.done():
-                    _task.cancel(msg=f"Gather failed due to task {_task.name}")
-            all_done_future.set_exception(e)
+            for other in tasks:
+                if not other.done():
+                    other.cancel(msg=f"Gather failed due to task {other.name}")
+            all_done.set_exception(e)
 
-    def _propagate_cancel(f: Future):
-        try:
-            f.result()
-        except CancelledError:
+    def on_gather_cancel(f: Future):
+        if f.cancelled():
             for t in tasks:
-                if t and not t.done():
+                if not t.done():
                     t.cancel(msg="Gather cancelled by parent")
 
     for i, coro in enumerate(coro_s):
         task = loop.ensure_task(coro)
-        task_to_index[task] = i
-        task.add_done_callback(_on_task_done)
-        tasks[i] = task
-    all_done_future.add_done_callback(_propagate_cancel)
-    return all_done_future
+        tasks[task] = i
+        task.add_done_callback(on_task_done)  # noqa
+
+    all_done.add_done_callback(on_gather_cancel)
+    return all_done
 
 
 def wait(
@@ -2408,7 +2397,7 @@ class SelectiveLockBase(BaseAsyncLock):
         self._id_counter += 1
         return self._id_counter
 
-    def _is_any_active(self, target_ids: set[int]|frozenset[int]) -> bool:
+    def _is_any_active(self, target_ids: set[int] | frozenset[int]) -> bool:
         """检查目标 ID 中是否还有活跃的（子类实现）"""
         raise NotImplementedError
 
