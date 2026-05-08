@@ -45,6 +45,7 @@ from typing import (
     TypeVar,
     Generic,
 )
+
 __all__ = (
     "EventLoop",
     "Task",
@@ -63,6 +64,8 @@ __all__ = (
     "AsyncCountdownLock",
     "AsyncSelectiveLock",
     "AsyncToggleLock",
+    "AsyncSemaphore",
+    "AsyncLock",
     "get_running_loop_safe",
     "CancelledError",
     "TimeoutError",
@@ -2349,7 +2352,7 @@ class SelectiveLockBase(BaseAsyncLock):
         """触发所有局部等待者的状态检查"""
         if not self._waiters:
             return
-        
+
         remaining = []
         for target_ids, fut in self._waiters:
             if not self._is_any_active(target_ids):
@@ -2490,7 +2493,7 @@ class AsyncSelectiveLock(SelectiveLockBase):
         """增加一个带标识的锁定任务，若未提供 task_id 则生成并返回一个自增 ID"""
         if task_id is None:
             task_id = self._next_id()
-        
+
         if task_id in self._active_ids:
             return task_id
 
@@ -2555,3 +2558,87 @@ class AsyncSelectiveLock(SelectiveLockBase):
         if task_id is not None:
             return task_id in self._active_ids
         return bool(self._active_ids)
+
+
+class AsyncSemaphore(BaseAsyncLock):
+    """
+    异步信号量：控制同时访问资源的协程数量。
+
+    通过内部计数器管理资源余量：
+    - acquire(): 减少计数，若计数为 0 则等待。
+    - release(): 增加计数，并唤醒等待者。
+    """
+
+    __slots__ = ("_value", "_waiters")
+
+    def __init__(self, value: int = 1):
+        """
+        Args:
+            value: 初始余量（并发数），默认为 1。
+        """
+        super().__init__()
+        if value < 0:
+            raise ValueError("Semaphore initial value must be >= 0")
+        self._value = value
+        self._waiters: deque[Future[None]] = deque()
+
+    def locked(self) -> bool:
+        """若没有余量，则返回 True"""
+        return self._value == 0
+
+    async def acquire(self) -> bool:
+        """
+        获取信号量。
+        如果计数器大于 0，则减 1 并立即返回。
+        如果计数器为 0，则挂起直到被 release 唤醒。
+        """
+        while self._value <= 0:
+            fut = get_running_loop().create_future()
+            self._waiters.append(fut)
+            try:
+                await fut
+            except CancelledError:
+                # 任务被取消时，确保把自己从排队名单中移除
+                if not fut.done() and fut in self._waiters:
+                    self._waiters.remove(fut)
+                # 移除后继续抛出取消异常
+                raise
+        
+        self._value -= 1
+        return True
+
+    def release(self):
+        """
+        释放信号量。
+        增加计数器，并尝试唤醒队列头部的第一个有效等待者。
+        """
+        self._value += 1
+        while self._waiters:
+            fut = self._waiters.popleft()
+            if not fut.done():
+                # 令牌直接转交给被唤醒的协程
+                self._value -= 1
+                fut.set_result(None)
+                break
+
+    async def __aenter__(self):
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self.release()
+
+
+class AsyncLock(AsyncSemaphore):
+    """
+    异步互斥锁（Mutex）：AsyncSemaphore(1) 的特化版本。
+
+    保证同一时间只有一个协程能持有该锁。
+    """
+
+    def __init__(self):
+        super().__init__(value=1)
+
+    def __repr__(self):
+        status = "locked" if self.locked() else "unlocked"
+        return f"<AsyncLock [{status}] waiters={len(self._waiters)}>"
