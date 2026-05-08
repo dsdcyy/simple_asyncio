@@ -415,8 +415,8 @@ async def main():
 run(main())
 ```
 
-### 5. 倒计时锁 (CountdownLock)
-类似 Java 的 `CountDownLatch`，等待一定数量的操作完成后放行。
+### 5. 异步计数屏障 (CountdownLock / WaitGroup)
+支持类似 Go `WaitGroup` 的动态计数，也支持类似 Java `CountDownLatch` 的固定倒计时。
 
 ```python
 from simple_asyncio import AsyncCountdownLock, run, sleep, get_running_loop
@@ -427,15 +427,16 @@ async def worker(lock, name):
     lock.release()
 
 async def main():
+    # 初始化计数为 3 (CountDownLatch 模式)
     lock = AsyncCountdownLock(count=3)
     
-    # 后台启动 3 个任务
+    # 后台启动 3 个并发任务
     for name in ["A", "B", "C"]:
         get_running_loop().create_task(worker(lock, name))
         
-    print("主流程等待 3 个任务完成...")
+    print("主流程阻塞中，等待所有计数归零...")
     await lock.wait_unlock()
-    print("所有任务已完成！")
+    print("✅ 所有任务已完成，主流程放行！")
 
 run(main())
 ```

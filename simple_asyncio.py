@@ -2097,10 +2097,18 @@ class AsyncCountdownLock(BaseAsyncLock):
 
     __slots__ = ("_unlock_count",)
 
-    def __init__(self):
-        """初始化计数器，默认计数为 0，初始状态为放行(Green Light)"""
+    def __init__(self, count: int = 0):
+        """
+        初始化计数器。
+        Args:
+            count: 初始计数。如果 > 0，则初始状态为锁定；如果为 0，则为放行。
+        """
         super().__init__()
-        self._unlock_count = 0
+        self._unlock_count = count
+        if count > 0:
+            self._pause()
+        else:
+            self._wake_up()
 
     def acquire(self):
         """
@@ -2560,7 +2568,7 @@ class AsyncSelectiveLock(SelectiveLockBase):
         return bool(self._active_ids)
 
 
-class AsyncSemaphore(BaseAsyncLock):
+class AsyncSemaphore:
     """
     异步信号量：控制同时访问资源的协程数量。
 
@@ -2576,7 +2584,6 @@ class AsyncSemaphore(BaseAsyncLock):
         Args:
             value: 初始余量（并发数），默认为 1。
         """
-        super().__init__()
         if value < 0:
             raise ValueError("Semaphore initial value must be >= 0")
         self._value = value
