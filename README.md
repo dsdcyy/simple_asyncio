@@ -451,12 +451,12 @@ async def job(lock, i):
     await lock.wait_unlock()  # 检查开关状态
     print(f"执行任务 {i}")
 
-async def controller(lock):
+async def controller(lock: AsyncToggleLock):
     print("🚫 系统暂停执行")
-    lock.pause() 
+    lock.deactivate() 
     await sleep(2)
     print("✅ 系统恢复执行")
-    lock.resume() 
+    lock.activate() 
 
 async def main():
     lock = AsyncToggleLock()

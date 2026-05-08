@@ -3,6 +3,9 @@
 # @Author : Ljw
 # @Time : 2026/5/6 17:11
 # @FileName  :main_test.py
+import socket
+import time
+
 from simple_asyncio import *
 
 
@@ -49,7 +52,7 @@ def main2():
     tasks = [test_task(i, 0.1) for i in range(10000)]
     all_done_future = gather(*tasks)
     # print((yield all_done_future))
-    yield all_done_future
+    res = yield all_done_future
     print("全部结束")
     return None
 

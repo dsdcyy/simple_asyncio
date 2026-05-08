@@ -1522,7 +1522,7 @@ def run(awaitable: Union[Awaitable[_T], Generator[Future[_T], Any, Any]]) -> _T:
 
 def gather(
     *coro_s: Union[Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T]]
-) -> Future[_T]:
+) -> Future[List[_T]]:
     """
     并发运行多个协程/任务，等待它们全部完成
 
@@ -1559,7 +1559,7 @@ def gather(
     results = [None] * len(coro_s)
     completed_count = 0
     failed = False
-    tasks = []
+    tasks: List[Task|None] = [None] * len(coro_s)
     task_to_index = {}
 
     def _on_task_done(task_f: Future):
@@ -1585,7 +1585,7 @@ def gather(
             # 只要有一个任务失败，gather 整体就宣告失败
             failed = True
             for _task in tasks:
-                if not _task.done():
+                if _task and not _task.done():
                     _task.cancel(msg=f"Gather failed due to task {_task.name}")
             all_done_future.set_exception(e)
 
@@ -1594,18 +1594,14 @@ def gather(
             f.result()
         except CancelledError:
             for t in tasks:
-                if not t.done():
+                if t and not t.done():
                     t.cancel(msg="Gather cancelled by parent")
 
     for i, coro in enumerate(coro_s):
-        task = coro
-        # 启动协程任务（支持生成器协程和原生协程）
-        if isinstance(task, (GeneratorType, CoroutineType)):
-            task = loop.create_task(coro)
-        # 绑定共享回调，避免为每个任务创建 lambda 闭包。
+        task = loop.ensure_task(coro)
         task_to_index[task] = i
         task.add_done_callback(_on_task_done)
-        tasks.append(task)
+        tasks[i] = task
     all_done_future.add_done_callback(_propagate_cancel)
     return all_done_future
 
@@ -1645,13 +1641,11 @@ def wait(
     # 统一转换成 Task 对象
     tasks = []
     for f in fs:
-        if isinstance(f, Task):
+        # 也可以支持 Future
+        if isinstance(f, Future):
             tasks.append(f)
-        elif isinstance(f, (GeneratorType, CoroutineType)):
-            tasks.append(loop.create_task(f))
         else:
-            # 也可以支持 Future
-            tasks.append(f)
+            tasks.append(loop.ensure_task(f))
 
     done = set()
     pending = set(tasks)
@@ -2027,9 +2021,9 @@ class BaseAsyncLock:
     __slots__ = ("_event", "_loop")
 
     def __init__(self):
-        self._event = Event()
         # 记录初始化时的事件循环，用于跨线程安全调度
         self._loop = get_running_loop_safe()
+        self._event = Event()
         # 默认初始状态为放行
         self._event.set()
 
