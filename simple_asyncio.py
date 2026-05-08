@@ -44,6 +44,7 @@ from typing import (
     Union,
     TypeVar,
     Generic,
+    Literal,
 )
 
 __all__ = (
@@ -81,6 +82,8 @@ _task_var: ContextVar[Optional["Task"]] = ContextVar("_task", default=None)
 FIRST_COMPLETED = "FIRST_COMPLETED"
 FIRST_EXCEPTION = "FIRST_EXCEPTION"
 ALL_COMPLETED = "ALL_COMPLETED"
+
+_return_when = Literal["FIRST_COMPLETED", "FIRST_EXCEPTION", "ALL_COMPLETED"]
 
 
 def get_running_loop() -> "EventLoop":
@@ -405,10 +408,10 @@ class Task(Future[_T]):
     )
 
     def __init__(
-        self,
-        gen: Union[Awaitable[Any], Generator[Any, Any, Any]],
-        loop: Optional["EventLoop"] = None,
-        name: Optional[str] = None,
+            self,
+            gen: Union[Awaitable[Any], Generator[Any, Any, Any]],
+            loop: Optional["EventLoop"] = None,
+            name: Optional[str] = None,
     ) -> None:
         """
         初始化 Task
@@ -427,7 +430,8 @@ class Task(Future[_T]):
         self._stepping = False
         self._rescheduled = False
         self._waiting: Optional[Future] = None  # 当前等待的 Future
-        self._context = contextvars.copy_context()
+        # 延迟复制 Context：在真正第一次运行任务时再复制，避免创建大量不必要的 Context
+        self._context = None
 
     def _on_done(self, f: Future) -> None:
         """
@@ -515,6 +519,10 @@ class Task(Future[_T]):
             finally:
                 _task_var.reset(token)
 
+        # 延迟在首次执行时复制 contextvars 上下文，降低 Task 创建开销
+        if self._context is None:
+            # 在首次运行时复制当前上下文
+            self._context = contextvars.copy_context()
         self._context.run(run_step)
 
     def _real_step(self, value: Any = None, is_exc: bool = False) -> None:
@@ -615,11 +623,11 @@ class TimerHandle:
     __slots__ = ("_callback", "_args", "_loop_ref", "_when", "_cancelled")
 
     def __init__(
-        self,
-        callback: Callable[..., Any],
-        args: Tuple[Any, ...],
-        loop: "EventLoop",
-        when: float,
+            self,
+            callback: Callable[..., Any],
+            args: Tuple[Any, ...],
+            loop: "EventLoop",
+            when: float,
     ) -> None:
         """
         初始化定时器句柄
@@ -816,9 +824,12 @@ class EventLoop:
         Thread Safety:
             此方法是线程安全的，可以从任何线程调用。
         """
+        current_loop = get_running_loop_safe()
         with self._ready_lock:
             self.call_soon(callback, *args)
-        self._wake_loop()
+        # 仅在跨线程路径需要唤醒事件循环
+        if current_loop is not self:
+            self._wake_loop()
 
     def _wake_loop(self) -> None:
         """
@@ -833,7 +844,7 @@ class EventLoop:
             pass  # 写端已关闭等异常忽略
 
     def run_in_thread_executor(
-        self, func: Callable[..., Any], *args: Any, **kwargs: Any
+            self, func: Callable[..., Any], *args: Any, **kwargs: Any
     ) -> Future:
         """
         在线程池中异步执行同步函数，返回 Future
@@ -883,7 +894,7 @@ class EventLoop:
         return f
 
     def set_exception_handler(
-        self, handler: Optional[Callable[["EventLoop", dict], None]]
+            self, handler: Optional[Callable[["EventLoop", dict], None]]
     ) -> None:
         """
         设置自定义异常处理器
@@ -938,7 +949,7 @@ class EventLoop:
         self._ready.append((callback, args))
 
     def call_later(
-        self, delay: float, callback: Callable[..., Any], *args: Any
+            self, delay: float, callback: Callable[..., Any], *args: Any
     ) -> TimerHandle:
         """
         延迟执行回调
@@ -964,11 +975,11 @@ class EventLoop:
         return handler
 
     def add_reader(
-        self,
-        fileobj: int,
-        callback: Callable[..., Any],
-        *args: Any,
-        one_shot: bool = False,
+            self,
+            fileobj: int,
+            callback: Callable[..., Any],
+            *args: Any,
+            one_shot: bool = False,
     ) -> None:
         """
         注册文件描述符的可读事件
@@ -982,11 +993,11 @@ class EventLoop:
         self._add_io_callback("read", fileobj, callback, args, one_shot)
 
     def add_writer(
-        self,
-        fileobj: int,
-        callback: Callable[..., Any],
-        *args: Any,
-        one_shot: bool = False,
+            self,
+            fileobj: int,
+            callback: Callable[..., Any],
+            *args: Any,
+            one_shot: bool = False,
     ) -> None:
         """
         注册文件描述符的可写事件
@@ -1022,12 +1033,12 @@ class EventLoop:
         return fileobj if isinstance(fileobj, int) else fileobj.fileno()
 
     def _add_io_callback(
-        self,
-        direction: str,
-        fileobj: int,
-        callback: Callable[..., Any],
-        args: Tuple[Any, ...],
-        one_shot: bool,
+            self,
+            direction: str,
+            fileobj: int,
+            callback: Callable[..., Any],
+            args: Tuple[Any, ...],
+            one_shot: bool,
     ) -> None:
         """内部：向 selector 的 direction 列表添加回调并更新注册。"""
         fd = self._fd(fileobj)
@@ -1055,18 +1066,48 @@ class EventLoop:
             new_events |= selectors.EVENT_READ
         if data.get("write"):
             new_events |= selectors.EVENT_WRITE
-
+        # 尝试读取当前注册信息以决定是否需要调用 modify/unregister
         try:
+            key = self._selector.get_key(fd)
+        except KeyError:
+            # 如果当前未注册，那么只有在 new_events 非零时才需要 register
             if new_events:
-                self._selector.modify(fd, new_events, data)
+                try:
+                    self._selector.register(fd, new_events, data)
+                except Exception:
+                    # 可能在并发情形下已被别人注册，忽略即可
+                    pass
+            return
+
+        # 已注册：仅在事件掩码或附带数据发生变化时才 modify，避免无谓的系统调用
+        try:
+            current_events = key.events
+            # 也在 data 对象身份变更时执行 modify（data 内容可能已更新）
+            if new_events:
+                if current_events != new_events or key.data is not data:
+                    try:
+                        self._selector.modify(fd, new_events, data)
+                    except KeyError:
+                        # 在高并发下，fd 可能已被移除，忽略即可
+                        pass
             else:
+                # new_events == 0：只有在仍然注册的情况下才注销
                 try:
                     self._selector.unregister(fd)
                 except KeyError:
                     pass
-        except KeyError:
-            # 在高并发下，fd 可能已被移除，忽略即可
-            pass
+        except Exception:
+            # 防御性捕获，避免在查询 key 时抛出异常影响主流程
+            try:
+                if new_events:
+                    self._selector.modify(fd, new_events, data)
+                else:
+                    try:
+                        self._selector.unregister(fd)
+                    except KeyError:
+                        pass
+            except Exception:
+                pass
 
     def _remove_io_callbacks(self, direction: str, fileobj: int) -> None:
         """内部：清空 direction 的回调并根据剩余回调修改或注销 selector 注册。"""
@@ -1080,7 +1121,7 @@ class EventLoop:
         self._update_selector_registration(fd, data)
 
     def _remove_specific_io_callback(
-        self, direction: str, fileobj: int, callback: Callable[..., Any]
+            self, direction: str, fileobj: int, callback: Callable[..., Any]
     ) -> None:
         """内部：从 direction 列表中移除指定回调（按函数对象匹配）。"""
         fd = self._fd(fileobj)
@@ -1095,11 +1136,11 @@ class EventLoop:
         self._update_selector_registration(fd, data)
 
     def add_reader_threadsafe(
-        self,
-        fileobj: int,
-        callback: Callable[..., Any],
-        *args: Any,
-        one_shot: bool = False,
+            self,
+            fileobj: int,
+            callback: Callable[..., Any],
+            *args: Any,
+            one_shot: bool = False,
     ) -> None:
         """线程安全地注册可读回调（可从其他线程调用）。"""
         # 使用 call_soon_threadsafe 在事件循环线程中执行实际注册
@@ -1108,11 +1149,11 @@ class EventLoop:
         )
 
     def add_writer_threadsafe(
-        self,
-        fileobj: int,
-        callback: Callable[..., Any],
-        *args: Any,
-        one_shot: bool = False,
+            self,
+            fileobj: int,
+            callback: Callable[..., Any],
+            *args: Any,
+            one_shot: bool = False,
     ) -> None:
         """线程安全地注册可写回调（可从其他线程调用）。"""
         self.call_soon_threadsafe(
@@ -1120,13 +1161,13 @@ class EventLoop:
         )
 
     def remove_reader_callback(
-        self, fileobj: int, callback: Callable[..., Any]
+            self, fileobj: int, callback: Callable[..., Any]
     ) -> None:
         """从 `fileobj` 的可读回调列表中移除指定回调（非线程安全）。"""
         self._remove_specific_io_callback("read", fileobj, callback)
 
     def remove_reader_callback_threadsafe(
-        self, fileobj: int, callback: Callable[..., Any]
+            self, fileobj: int, callback: Callable[..., Any]
     ) -> None:
         """线程安全地从 `fileobj` 的可读回调列表中移除指定回调。"""
         self.call_soon_threadsafe(
@@ -1134,13 +1175,13 @@ class EventLoop:
         )
 
     def remove_writer_callback(
-        self, fileobj: int, callback: Callable[..., Any]
+            self, fileobj: int, callback: Callable[..., Any]
     ) -> None:
         """从 `fileobj` 的可写回调列表中移除指定回调（非线程安全）。"""
         self._remove_specific_io_callback("write", fileobj, callback)
 
     def remove_writer_callback_threadsafe(
-        self, fileobj: int, callback: Callable[..., Any]
+            self, fileobj: int, callback: Callable[..., Any]
     ) -> None:
         """线程安全地从 `fileobj` 的可写回调列表中移除指定回调。"""
         self.call_soon_threadsafe(
@@ -1148,9 +1189,9 @@ class EventLoop:
         )
 
     def create_task(
-        self,
-        gen: Union[Generator[Future[_T], Any, Any], Awaitable[_T]],
-        name: Optional[str] = None,
+            self,
+            gen: Union[Generator[Future[_T], Any, Any], Awaitable[_T]],
+            name: Optional[str] = None,
     ) -> Task[_T]:
         """
         创建异步任务
@@ -1196,7 +1237,7 @@ class EventLoop:
         return Future(self)
 
     def gather(
-        self, *coro_s: Union[Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T]]
+            self, *coro_s: Union[Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T]]
     ) -> Future[_T]:
         """
         便捷方法：调用模块级 `gather`。
@@ -1204,10 +1245,10 @@ class EventLoop:
         return gather(*coro_s)
 
     def wait(
-        self,
-        fs: List[Union[Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T]]],
-        timeout: Optional[float] = None,
-        return_when: str = ALL_COMPLETED,
+            self,
+            fs: List[Union[Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T]]],
+            timeout: Optional[float] = None,
+            return_when: str = ALL_COMPLETED,
     ) -> Future[_T]:
         """
         便捷方法：调用模块级 `wait`。
@@ -1215,7 +1256,7 @@ class EventLoop:
         return wait(fs, timeout=timeout, return_when=return_when)
 
     def wait_for(
-        self, aw: Union[Awaitable[_T], Generator[Future[_T], Any, Any]], timeout: float
+            self, aw: Union[Awaitable[_T], Generator[Future[_T], Any, Any]], timeout: float
     ) -> Future[_T]:
         """
         便捷方法：调用模块级 `wait_for`。
@@ -1223,7 +1264,7 @@ class EventLoop:
         return wait_for(aw, timeout=timeout)
 
     def run(
-        self, awaitable: Union[Generator[Future[_T], Any, Any], Task[_T], Future[_T]]
+            self, awaitable: Union[Generator[Future[_T], Any, Any], Task[_T], Future[_T]]
     ) -> _T:
         """
         直接运行一个 awaitable（生成器/Task/Future）并返回最终结果。
@@ -1303,30 +1344,41 @@ class EventLoop:
         data = key.data
         fd = key.fileobj
 
+        # 收集待排队的回调，稍后批量入队以减少锁争用
+        to_schedule: list[tuple[Callable[..., Any], Tuple[Any, ...]]] = []
         for direction, event_flag in (
-            ("read", selectors.EVENT_READ),
-            ("write", selectors.EVENT_WRITE),
+                ("read", selectors.EVENT_READ),
+                ("write", selectors.EVENT_WRITE),
         ):
             if not (mask & event_flag):
                 continue
 
-            # 复制列表以便在回调过程中安全遍历/修改原始列表
-            callback_list = list(data.get(direction, []))
-            for item in callback_list:
+            # 遍历原始列表以避免每次分配 callback_list，收集需要移除的一次性条目
+            lst = data.get(direction, [])
+            if not lst:
+                continue
+            to_remove: list[tuple[Callable[..., Any], Tuple[Any, ...], bool]] = []
+            for item in lst:
                 cb, args, one_shot = item
-                try:
-                    self.call_soon(cb, *args)
-                except Exception as e:
-                    # call_soon 本身不应抛，但捕获以防止影响其它回调
-                    self._report_error(
-                        "Exception scheduling callback", e, callback=cb, args=args
-                    )
-
+                to_schedule.append((cb, args))
                 if one_shot:
-                    try:
-                        data[direction].remove(item)
-                    except ValueError:
-                        pass
+                    to_remove.append(item)
+            if to_remove:
+                try:
+                    data[direction][:] = [
+                        it for it in data.get(direction, []) if it not in to_remove
+                    ]
+                except Exception:
+                    for item in to_remove:
+                        try:
+                            data[direction].remove(item)
+                        except ValueError:
+                            pass
+
+        # 批量将回调加入就绪队列（在锁内一次性操作以减少争用）
+        if to_schedule:
+            with self._ready_lock:
+                self._ready.extend(to_schedule)
 
         # 更新 selector 注册（封装以避免重复代码）
         self._update_selector_registration(fd, data)
@@ -1340,6 +1392,12 @@ class EventLoop:
             # 1. 获取当前时间戳（每一轮循环开始时更新）
             now = time.monotonic()
 
+            # 局部绑定常用属性以减少属性查找开销
+            selector = self._selector
+            select = selector.select
+            get_map = selector.get_map
+            ready_lock = self._ready_lock
+
             # 2. 检查定时器是否到期，移到就绪队列
             while self._scheduled and self._scheduled[0][0] <= now:
                 _, _, handler = heapq.heappop(self._scheduled)
@@ -1351,12 +1409,12 @@ class EventLoop:
                 _timeout = 0.0
             elif self._scheduled:
                 _timeout = max(self._scheduled[0][0] - now, 0.0)
-            elif len(self._selector.get_map()) <= 1:
+            elif len(get_map()) <= 1:
                 # 只剩自唤醒管道时，仍可能等待其他线程提交回调。
                 # 某些受限环境可能禁止跨线程写 socketpair，保留短轮询兜底。
                 _timeout = self._thread_wakeup_poll_interval
             # 获取selector的事件列表
-            events = self._selector.select(_timeout)
+            events = select(_timeout)
             for key, mask in events:
                 # 将事件处理委托到单独方法，减少重复并提高可测性
                 try:
@@ -1368,16 +1426,18 @@ class EventLoop:
                         key=key,
                         mask=mask,
                     )
-            # 4. 执行所有就绪队列里的回调
-            # 限制执行当前长度的任务，避免 call_soon 导致的无限忙轮询
+            # 4. 执行所有就绪队列里的回调（批量交换以减少锁持有时间）
             with self._ready_lock:
-                n = len(self._ready)
-            for _ in range(n):
-                with self._ready_lock:
-                    if not self._ready:
-                        break
-                    cb, args = self._ready.popleft()
-                self._complete_a_task(cb, *args)
+                if self._ready:
+                    ready_to_process = self._ready
+                    self._ready = deque()
+                else:
+                    ready_to_process = None
+
+            if ready_to_process:
+                while ready_to_process:
+                    cb, args = ready_to_process.popleft()
+                    self._complete_a_task(cb, *args)
 
             # 5. 决定是继续干活还是休息
             # 如果已经停止运行（如主任务已完成），或者还有就绪任务，则不再进入休眠
@@ -1404,10 +1464,10 @@ class EventLoop:
         self._running = False
 
     def ensure_task(
-        self,
-        task: Union[
-            Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T], Future[_T]
-        ],
+            self,
+            task: Union[
+                Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T], Future[_T]
+            ],
     ) -> Task[_T]:
         """
         确保输入被转换为 Task 对象
@@ -1444,7 +1504,7 @@ class EventLoop:
             new_task = self.create_task(wrapper())
             return new_task
         elif isinstance(task, (GeneratorType, CoroutineType)) or hasattr(
-            task, "__await__"
+                task, "__await__"
         ):
             # 协程或生成器，创建新的 Task
             return self.create_task(task)
@@ -1521,7 +1581,7 @@ def run(awaitable: Union[Awaitable[_T], Generator[Future[_T], Any, Any]]) -> _T:
 
 
 def gather(
-    *coro_s: Union[Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T]]
+        *coro_s: Union[Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T]]
 ) -> Future[List[_T]]:
     """
     并发运行多个协程/任务，等待它们全部完成
@@ -1559,7 +1619,7 @@ def gather(
     results = [None] * len(coro_s)
     completed_count = 0
     failed = False
-    tasks: List[Task|None] = [None] * len(coro_s)
+    tasks: List[Task | None] = [None] * len(coro_s)
     task_to_index = {}
 
     def _on_task_done(task_f: Future):
@@ -1607,9 +1667,9 @@ def gather(
 
 
 def wait(
-    fs: List[Union[Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T]]],
-    timeout: Optional[float] = None,
-    return_when: str = ALL_COMPLETED,
+        fs: List[Union[Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T]]],
+        timeout: Optional[float] = None,
+        return_when: _return_when = ALL_COMPLETED,
 ) -> Future[Tuple[Set[Task], Set[Task]]]:
     """
     等待一组任务完成
@@ -1637,23 +1697,13 @@ def wait(
     """
     loop = get_running_loop()
     wait_future = loop.create_future()
-
-    # 统一转换成 Task 对象
-    tasks = []
-    for f in fs:
-        # 也可以支持 Future
-        if isinstance(f, Future):
-            tasks.append(f)
-        else:
-            tasks.append(loop.ensure_task(f))
-
     done = set()
-    pending = set(tasks)
-    timeout_handle = None
-
-    if not tasks:
-        wait_future.set_result((done, pending))
+    if not fs:
+        wait_future.set_result((done, set()))
         return wait_future
+    ensure_task = loop.ensure_task
+    pending = {f if isinstance(f, Future) else ensure_task(f) for f in fs}
+    timeout_handle = None
 
     def _on_completion(task):
         if wait_future.done():
@@ -1680,7 +1730,7 @@ def wait(
             wait_future.set_result((done, pending))
 
     # 启动监听
-    for t in tasks:
+    for t in list(pending):
         if t.done():
             _on_completion(t)
         else:
@@ -1699,7 +1749,7 @@ def wait(
 
 
 def wait_for(
-    aw: Union[Awaitable[_T], Generator[Future[_T], Any, Any]], timeout: float
+        aw: Union[Awaitable[_T], Generator[Future[_T], Any, Any]], timeout: float
 ) -> Future[_T]:
     """
     等待单个异步操作完成，带超时限制
@@ -1759,7 +1809,7 @@ def wait_for(
 
 
 def create_task(
-    aw: Union[Awaitable[_T], Generator[Future[_T], Any, Any]], name: str = None
+        aw: Union[Awaitable[_T], Generator[Future[_T], Any, Any]], name: str = None
 ) -> Task[_T]:
     """
     创建一个 Task 对象
@@ -2024,7 +2074,7 @@ class BaseAsyncLock:
         # 记录初始化时的事件循环，用于跨线程安全调度
         self._loop = get_running_loop_safe()
         self._event = Event()
-        # 默认初始状态为放行
+        # 默认初始状态为放行状态
         self._event.set()
 
     def _safe_dispatch(self, action_name: str):
@@ -2101,8 +2151,6 @@ class AsyncCountdownLock(BaseAsyncLock):
         self._unlock_count = count
         if count > 0:
             self._pause()
-        else:
-            self._wake_up()
 
     def acquire(self):
         """
@@ -2326,6 +2374,17 @@ class AsyncQueue(Generic[_T]):
             break
 
 
+class WaiterEntry:
+    __slots__ = ("target_ids", "fut")
+
+    def __init__(self, target_ids: frozenset, fut: Future[None]):
+        self.target_ids: frozenset[int] = target_ids
+        self.fut: Future[None] = fut
+
+    def __repr__(self) -> str:
+        return f"_WaiterEntry(target_ids={self.target_ids}, fut={self.fut})"
+
+
 class SelectiveLockBase(BaseAsyncLock):
     """
     选择性锁基类：提供基于自增 ID 的局部等待机制。
@@ -2334,35 +2393,84 @@ class SelectiveLockBase(BaseAsyncLock):
     子类须实现 _is_any_active(target_ids) 以定义"活跃"语义。
     """
 
-    __slots__ = ("_waiters", "_id_counter")
+    __slots__ = ("_waiters", "_waiters_all", "_id_counter")
 
     def __init__(self):
         super().__init__()
         self._id_counter: int = 0
-        self._waiters: list[tuple[set[int], Future[None]]] = []
+        # _waiters: dict mapping tid -> set of _WaiterEntry instances
+        self._waiters: dict[int, set[WaiterEntry]] = {}
+        # _waiters_all: set containing all _WaiterEntry instances (for full-scan operations)
+        self._waiters_all: set[WaiterEntry] = set()
 
     def _next_id(self) -> int:
         """分配下一个唯一 ID"""
         self._id_counter += 1
         return self._id_counter
 
-    def _is_any_active(self, target_ids: set[int]) -> bool:
+    def _is_any_active(self, target_ids: set[int]|frozenset[int]) -> bool:
         """检查目标 ID 中是否还有活跃的（子类实现）"""
         raise NotImplementedError
 
     def _trigger_waiters_check(self):
         """触发所有局部等待者的状态检查"""
-        if not self._waiters:
+        if not self._waiters_all:
             return
 
-        remaining = []
-        for target_ids, fut in self._waiters:
-            if not self._is_any_active(target_ids):
-                if not fut.done():
-                    fut.set_result(None)
+        remaining = set()
+        # 全量扫描：用于回退/强制场景，保持原有语义
+        for entry in list(self._waiters_all):
+            if not self._is_any_active(entry.target_ids):
+                if not entry.fut.done():
+                    entry.fut.set_result(None)
+                # remove below
+                self._waiters_all.discard(entry)
+                for tid in entry.target_ids:
+                    s = self._waiters.get(tid)
+                    if s:
+                        s.discard(entry)
+                        if not s:
+                            del self._waiters[tid]
             else:
-                remaining.append((target_ids, fut))
-        self._waiters = remaining
+                remaining.add(entry)
+
+        # rebuild map from remaining (defensive: ensure consistency)
+        if remaining:
+            self._waiters_all = remaining
+            self._waiters.clear()
+            for entry in remaining:
+                for tid in entry.target_ids:
+                    self._waiters.setdefault(tid, set()).add(entry)
+        else:
+            self._waiters_all.clear()
+            self._waiters.clear()
+
+    def _trigger_waiters_for_t_ids(self, t_ids: set[int]):
+        """仅触发与给定 t_ids 有交集的等待者，避免全表扫描"""
+        if not self._waiters_all:
+            return
+
+        impacted: set[WaiterEntry] = set()
+        for tid in t_ids:
+            s = self._waiters.get(tid)
+            if s:
+                impacted.update(s)
+
+        if not impacted:
+            return
+
+        for entry in list(impacted):
+            if not self._is_any_active(entry.target_ids):
+                if not entry.fut.done():
+                    entry.fut.set_result(None)
+                # remove from global set and per-tid index
+                self._waiters_all.discard(entry)
+                for t in entry.target_ids:
+                    s = self._waiters.get(t)
+                    if s:
+                        s.discard(entry)
+                        if not s:
+                            del self._waiters[t]
 
     async def _wait_for_ids(self, target_set: set[int]) -> None:
         """
@@ -2376,18 +2484,33 @@ class SelectiveLockBase(BaseAsyncLock):
         if not self._is_any_active(target_set):
             return
         fut = get_running_loop().create_future()
-        self._waiters.append((target_set, fut))
-        await fut
+        entry = WaiterEntry(frozenset(target_set), fut)
+        # insert into global set and per-tid index
+        self._waiters_all.add(entry)
+        for tid in entry.target_ids:
+            self._waiters.setdefault(tid, set()).add(entry)
+        try:
+            await fut
+        finally:
+            # 清理：从全局集合和索引中移除该 waiter
+            if entry in self._waiters_all:
+                self._waiters_all.discard(entry)
+                for tid in entry.target_ids:
+                    s = self._waiters.get(tid)
+                    if s:
+                        s.discard(entry)
+                        if not s:
+                            del self._waiters[tid]
 
     async def _on_force(self, target_set: set[int]) -> None:
         """超时强制清理钩子（子类实现）"""
         raise NotImplementedError
 
     async def wait_unlock(
-        self,
-        target_ids: Union[list[int], set[int], None] = None,
-        duration: Optional[float] = None,
-        force: bool = False,
+            self,
+            target_ids: Union[list[int], set[int], None] = None,
+            duration: Optional[float] = None,
+            force: bool = False,
     ):
         """
         等待解锁。
@@ -2511,8 +2634,12 @@ class AsyncSelectiveLock(SelectiveLockBase):
 
         self._active_ids.discard(task_id)
 
-        # 1. 局部解锁逻辑：检查是否有等待特定 ID 集合的协程
-        self._trigger_waiters_check()
+        # 1. 局部解锁逻辑：仅触发与该 tid 有关的等待者，避免全表扫描
+        try:
+            self._trigger_waiters_for_t_ids({task_id})
+        except AttributeError:
+            # 回退：若索引尚未建立，则做全表检查以保证兼容性
+            self._trigger_waiters_check()
 
         # 2. 全局解锁逻辑
         if not self._active_ids:
@@ -2535,10 +2662,12 @@ class AsyncSelectiveLock(SelectiveLockBase):
         - target_ids=[...]: 局部强拆。将指定的 ID 强行移出活跃集，并同步驱动等待者检查。
         """
         if target_ids is None:
+            # 全量强拆：清空活跃集合并放行所有等待者
             self._active_ids.clear()
-            for _, fut in self._waiters:
-                if not fut.done():
-                    fut.set_result(None)
+            for entry in list(self._waiters_all):
+                if not entry.fut.done():
+                    entry.fut.set_result(None)
+            self._waiters_all.clear()
             self._waiters.clear()
             self._wake_up()
         else:
@@ -2550,7 +2679,11 @@ class AsyncSelectiveLock(SelectiveLockBase):
                     changed = True
 
             if changed:
-                self._trigger_waiters_check()
+                # 仅触发受影响的等待者
+                try:
+                    self._trigger_waiters_for_t_ids(target_set)
+                except AttributeError:
+                    self._trigger_waiters_check()
 
             if not self._active_ids:
                 self._wake_up()
