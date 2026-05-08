@@ -2592,18 +2592,17 @@ class AsyncSemaphore(BaseAsyncLock):
         如果计数器大于 0，则减 1 并立即返回。
         如果计数器为 0，则挂起直到被 release 唤醒。
         """
-        while self._value <= 0:
+        if self._value <= 0:
             fut = get_running_loop().create_future()
             self._waiters.append(fut)
             try:
                 await fut
+                return True
             except CancelledError:
-                # 任务被取消时，确保把自己从排队名单中移除
                 if not fut.done() and fut in self._waiters:
                     self._waiters.remove(fut)
-                # 移除后继续抛出取消异常
                 raise
-        
+
         self._value -= 1
         return True
 

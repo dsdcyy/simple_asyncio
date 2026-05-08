@@ -13,9 +13,9 @@
 
 - ✅ **事件循环** - 基于 `selectors` 的 I/O 多路复用
 - ✅ **Future/Task 系统** - 协程调度和状态管理
-- ✅ **定时器管理** - 延迟回调和超时控制
-- ✅ **线程安全调度** - `call_soon_threadsafe` 实现
-- ✅ **异步原语** - `sleep`, `gather`, `wait`, `wait_for`
+- ✅ **同步原语** - `Lock`, `Semaphore`, `Event`, `Queue`
+- ✅ **高级策略锁** - `SelectiveLock`, `CountdownLock`, `ToggleLock`
+- ✅ **异步工具** - `sleep`, `gather`, `wait`, `wait_for`
 - ✅ **异步 Socket** - 非阻塞网络编程支持
 - ✅ **协作式多任务** - 同步生成器通过 `yield_control()` 参与调度
 
@@ -327,6 +327,147 @@ loop.remove_reader_callback(sock, on_read_a)
 
 
 ---
+
+## 🔐 同步与通信
+
+库提供了一套完整的异步同步原语，用于协程间的状态同步和数据传递。
+
+### 1. 基础锁与信号量
+支持经典的 `async with` 语法。
+
+```python
+from simple_asyncio import AsyncLock, AsyncSemaphore, run, gather, sleep
+
+async def worker(name, lock):
+    async with lock:
+        print(f"{name} 获得了锁")
+        await sleep(1)
+    print(f"{name} 释放了锁")
+
+async def main():
+    # 互斥锁
+    lock = AsyncLock()
+    # 信号量（并发度为 2）
+    sem = AsyncSemaphore(2)
+    
+    await gather(worker("A", lock), worker("B", lock))
+
+run(main())
+```
+
+### 2. 事件同步 (Event)
+
+```python
+from simple_asyncio import Event, run, sleep, gather
+
+async def waiter(event):
+    print("等待事件触发...")
+    await event.wait()
+    print("事件已触发，继续执行！")
+
+async def setter(event):
+    await sleep(2)
+    print("触发事件！")
+    event.set()
+
+run(gather(waiter(event := Event()), setter(event)))
+```
+
+### 3. 异步队列 (AsyncQueue)
+
+```python
+from simple_asyncio import AsyncQueue, run, sleep
+
+async def producer(q):
+    for i in range(5):
+        await q.put(f"数据-{i}")
+        await sleep(0.5)
+
+async def consumer(q):
+    while True:
+        item = await q.get()
+        print(f"消费: {item}")
+        if item == "数据-4": break
+
+run(AsyncQueue().run_tasks(producer, consumer))
+```
+
+### 4. 高级策略锁 (SelectiveLock)
+允许你等待一组任务中的**特定子集**，而无需等待全部。
+
+```python
+from simple_asyncio import AsyncSelectiveLock, run, sleep, gather
+
+async def main():
+    lock = AsyncSelectiveLock()
+    
+    # 领票执行
+    async with lock as tid1: # ID: 1
+        await sleep(1)
+        
+    async with lock as tid2: # ID: 2
+        await sleep(5)
+
+    # 局部等待：只等 ID 1 完成，不管 ID 2
+    await lock.wait_unlock(target_ids=[1])
+    print("ID 1 已完成，流程继续")
+
+run(main())
+```
+
+### 5. 倒计时锁 (CountdownLock)
+类似 Java 的 `CountDownLatch`，等待一定数量的操作完成后放行。
+
+```python
+from simple_asyncio import AsyncCountdownLock, run, sleep, get_running_loop
+
+async def worker(lock, name):
+    await sleep(1)
+    print(f"{name} 完成")
+    lock.release()
+
+async def main():
+    lock = AsyncCountdownLock(count=3)
+    
+    # 后台启动 3 个任务
+    for name in ["A", "B", "C"]:
+        get_running_loop().create_task(worker(lock, name))
+        
+    print("主流程等待 3 个任务完成...")
+    await lock.wait_unlock()
+    print("所有任务已完成！")
+
+run(main())
+```
+
+### 6. 开关锁 (ToggleLock)
+支持手动暂停和恢复的全局开关，非常适合做全局的暂停/继续流控。
+
+```python
+from simple_asyncio import AsyncToggleLock, run, sleep, get_running_loop
+
+async def job(lock, i):
+    await lock.wait_unlock()  # 检查开关状态
+    print(f"执行任务 {i}")
+
+async def controller(lock):
+    print("🚫 系统暂停执行")
+    lock.pause() 
+    await sleep(2)
+    print("✅ 系统恢复执行")
+    lock.resume() 
+
+async def main():
+    lock = AsyncToggleLock()
+    
+    # 立即触发几个任务，但它们会被控制器卡住
+    for i in range(3):
+        get_running_loop().create_task(job(lock, i))
+        
+    await controller(lock)
+
+run(main())
+```
 
 ## 🎯 高级特性
 
