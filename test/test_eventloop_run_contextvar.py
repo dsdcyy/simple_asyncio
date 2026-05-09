@@ -3,11 +3,8 @@
 """
 测试 EventLoop.run() 方法是否正确设置 ContextVar
 """
-import sys
 
-sys.path.insert(0, "/media/Ljw/Data/fetch_tool")
-
-from simple_asyncio import EventLoop, get_running_loop, sleep
+from simple_asyncio import EventLoop, get_running_loop
 
 
 def test_eventloop_run_sets_contextvar():

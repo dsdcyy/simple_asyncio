@@ -3,9 +3,6 @@
 """
 测试 TimerHandle 功能
 """
-import sys
-
-sys.path.insert(0, "/media/Ljw/Data/fetch_tool")
 
 from simple_asyncio import run, sleep, get_event_loop
 
@@ -88,7 +85,7 @@ async def test_sleep_cancel():
     print("测试 3: sleep 取消传播")
     print("=" * 70)
 
-    from simple_asyncio import CancelledError
+    from simple_asyncio import FutureCancelledError
 
     loop = get_event_loop()
 
@@ -97,7 +94,7 @@ async def test_sleep_cancel():
             print("  [Task] 开始 sleep(10)...")
             await sleep(10)
             print("  [Task] sleep 完成（不应该到达这里）")
-        except CancelledError as e:
+        except FutureCancelledError as e:
             print(f"  [Task] sleep 被取消: {e}")
             raise
 
@@ -123,7 +120,7 @@ async def test_wait_for_timeout():
     print("测试 4: wait_for 超时")
     print("=" * 70)
 
-    from simple_asyncio import wait_for, TimeoutError
+    from simple_asyncio import wait_for, AsyncioTimeoutError
 
     loop = get_event_loop()
 
@@ -134,9 +131,9 @@ async def test_wait_for_timeout():
 
     try:
         print("  [Main] 等待慢任务（超时 0.2 秒）...")
-        result = await wait_for(slow_task(), timeout=0.2)
+        result = await wait_for(slow_task(), timeout_delay=0.2)
         print(f"  [Main] 结果: {result}（不应该到达这里）")
-    except TimeoutError:
+    except AsyncioTimeoutError:
         print("  [Main] ✅ 正确抛出 TimeoutError")
 
     await sleep(0.1)

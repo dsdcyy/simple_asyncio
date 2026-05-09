@@ -3,9 +3,7 @@
 """
 测试同步代码通过 yield 实现协作式多任务
 """
-import sys
 
-sys.path.insert(0, "/media/Ljw/Data/fetch_tool")
 
 from simple_asyncio import run, sleep, get_event_loop, yield_control
 

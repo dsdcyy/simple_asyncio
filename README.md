@@ -376,20 +376,33 @@ run(gather(waiter(event := Event()), setter(event)))
 ### 3. 异步队列 (AsyncQueue)
 
 ```python
-from simple_asyncio import AsyncQueue, run, sleep
+from simple_asyncio import AsyncQueue, run, sleep, create_task, gather
+
 
 async def producer(q):
-    for i in range(5):
-        await q.put(f"数据-{i}")
-        await sleep(0.5)
+   for i in range(5):
+      await q.put(f"数据-{i}")
+      await sleep(0.5)
+
 
 async def consumer(q):
-    while True:
-        item = await q.get()
-        print(f"消费: {item}")
-        if item == "数据-4": break
+   while True:
+      item = await q.get()
+      print(f"消费: {item}")
+      if item == "数据-4": break
 
-run(AsyncQueue().run_tasks(producer, consumer))
+
+async def main():
+   q = AsyncQueue()
+   # 启动消费者
+   consumer_task = create_task(consumer(q))
+   # 启动生产者
+   producer_task = create_task(producer(q))
+   # 等待所有任务完成
+   await gather(consumer_task, producer_task)
+
+
+run(main())
 ```
 
 ### 4. 高级策略锁 (SelectiveLock)
@@ -419,7 +432,7 @@ run(main())
 支持类似 Go `WaitGroup` 的动态计数，也支持类似 Java `CountDownLatch` 的固定倒计时。
 
 ```python
-from simple_asyncio import AsyncCountdownLock, run, sleep, get_running_loop
+from simple_asyncio import AsyncCountdownLock, run, sleep, create_task, gather
 
 async def worker(lock, name):
     await sleep(1)
@@ -429,10 +442,9 @@ async def worker(lock, name):
 async def main():
     # 初始化计数为 3 (CountDownLatch 模式)
     lock = AsyncCountdownLock(count=3)
-    
     # 后台启动 3 个并发任务
     for name in ["A", "B", "C"]:
-        get_running_loop().create_task(worker(lock, name))
+        _ = create_task(worker(lock, name))
         
     print("主流程阻塞中，等待所有计数归零...")
     await lock.wait_unlock()
@@ -463,7 +475,7 @@ async def main():
     
     # 立即触发几个任务，但它们会被控制器卡住
     for i in range(3):
-        get_running_loop().create_task(job(lock, i))
+        _ = get_running_loop().create_task(job(lock, i))
         
     await controller(lock)
 
@@ -499,30 +511,34 @@ assert id(loop1) != id(loop2)  # 不同的循环实例
 ### 任务取消与传播
 
 ```python
-from simple_asyncio import run, sleep, CancelledError,get_running_loop
+from simple_asyncio import run, sleep, FutureCancelledError, get_running_loop
+
 
 async def long_task():
-    try:
-        print("开始长任务...")
-        await sleep(10)
-        return "完成"
-    except CancelledError as e:
-        print(f"任务被取消: {e.cancel_msg()}")
-        raise  # 必须重新抛出
+   try:
+      print("开始长任务...")
+      await sleep(10)
+      return "完成"
+   except FutureCancelledError as e:
+      print(f"任务被取消: {e.cancel_msg()}")
+      raise  # 必须重新抛出
+
 
 task = None
 
+
 async def main():
-    global task
-    task = get_running_loop().create_task(long_task())
-    
-    await sleep(0.5)
-    task.cancel(msg="超时取消")
-    
-    try:
-        await task
-    except CancelledError:
-        print("已捕获取消异常")
+   global task
+   task = get_running_loop().create_task(long_task())
+
+   await sleep(0.5)
+   task.cancel(msg="超时取消")
+
+   try:
+      await task
+   except FutureCancelledError:
+      print("已捕获取消异常")
+
 
 run(main())
 ```
@@ -530,17 +546,19 @@ run(main())
 ### 超时控制
 
 ```python
-from simple_asyncio import run, sleep, wait_for, TimeoutError
+from simple_asyncio import run, sleep, wait_for, AsyncioTimeoutError
+
 
 async def slow_task():
-    await sleep(5)
-    return "完成"
+   await sleep(5)
+   return "完成"
+
 
 try:
-    # 设置 1 秒超时
-    result = run(wait_for(slow_task(), timeout=1.0))
-except TimeoutError:
-    print("任务超时！")
+   # 设置 1 秒超时
+   result = run(wait_for(slow_task(), timeout_delay=1.0))
+except AsyncioTimeoutError:
+   print("任务超时！")
 ```
 
 ---

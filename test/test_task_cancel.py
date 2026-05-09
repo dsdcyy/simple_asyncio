@@ -3,11 +3,8 @@
 """
 测试 Task 的 name 和 cancel 功能
 """
-import sys
 
-sys.path.insert(0, "/media/Ljw/Data/fetch_tool")
-
-from simple_asyncio import run, sleep, CancelledError, get_event_loop
+from simple_asyncio import run, sleep, FutureCancelledError, get_event_loop
 
 
 async def test_task_name_and_cancel():
@@ -48,7 +45,7 @@ async def test_task_name_and_cancel():
                 print(f"  [Task] 执行第 {i+1} 步...")
                 await sleep(0.5)
             return "完成"
-        except CancelledError as e:
+        except FutureCancelledError as e:
             print(f"  [Task] 被取消: {e}")
             raise
 
@@ -70,7 +67,7 @@ async def test_task_name_and_cancel():
     try:
         await task3
         print("❌ 不应该到达这里")
-    except CancelledError as e:
+    except FutureCancelledError as e:
         print(f"\n✅ 正确抛出 CancelledError: {e}")
 
     print("\n" + "=" * 70)

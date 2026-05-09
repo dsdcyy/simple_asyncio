@@ -3,11 +3,8 @@
 """
 测试 Future cancel 功能
 """
-import sys
 
-sys.path.insert(0, "/media/Ljw/Data/fetch_tool")
-
-from simple_asyncio import run, CancelledError, get_event_loop
+from simple_asyncio import run, FutureCancelledError, get_event_loop
 
 
 async def test_future_cancel():
@@ -42,7 +39,7 @@ async def test_future_cancel():
     # 验证异常
     try:
         f.result()
-    except CancelledError as e:
+    except FutureCancelledError as e:
         print(f"\n✅ CancelledError raised: {e}")
 
     print("\n" + "=" * 70)

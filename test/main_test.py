@@ -108,7 +108,7 @@ async def main5():
             await sleep(10)
             print(f"[{name}] 完成")
             return f"{name}_done"
-        except CancelledError as e:
+        except FutureCancelledError as e:
             print(f"[{name}] 被取消！")
             raise
 

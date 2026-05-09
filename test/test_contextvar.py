@@ -3,11 +3,9 @@
 """
 测试 ContextVar 在事件循环中的优势
 """
-import sys
 
-sys.path.insert(0, "/media/Ljw/Data/fetch_tool")
 
-from simple_asyncio import run, sleep, get_running_loop, get_event_loop
+from simple_asyncio import run, sleep, get_running_loop
 
 
 async def test_context_isolation():
@@ -56,8 +54,6 @@ def test_multiple_loops():
     print("\n" + "=" * 70)
     print("测试 3: 多个独立事件循环")
     print("=" * 70)
-
-    from simple_asyncio import EventLoop, _loop_var
 
     # 第一个循环
     async def task1():
