@@ -45,6 +45,7 @@ from typing import (
     TypeVar,
     Generic,
     Literal,
+    AsyncGenerator,
 )
 
 __all__ = (
@@ -70,7 +71,7 @@ __all__ = (
     "AsyncLock",
     "get_running_loop_safe",
     "FutureCancelledError",
-    "AsyncioTimeoutError",
+    "AsyncTimeoutError",
     "yield_control",
 )
 logger = logging.getLogger(__name__)
@@ -135,7 +136,7 @@ class FutureCancelledError(Exception):
     pass
 
 
-class AsyncioTimeoutError(Exception):
+class AsyncTimeoutError(Exception):
     """操作超时时抛出的异常"""
 
     pass
@@ -433,6 +434,15 @@ class Task(Future[_T]):
         self._waiting: Optional[Future] = None  # 当前等待的 Future
         # 延迟复制 Context：在真正第一次运行任务时再复制，避免创建大量不必要的 Context
         self._context = None
+
+    def get_name(self) -> str:
+        """
+        获取任务名称
+
+        Returns:
+            str: 任务名称
+        """
+        return self.name
 
     def _on_done(self, f: Future) -> None:
         """
@@ -825,9 +835,9 @@ class EventLoop:
         Thread Safety:
             此方法是线程安全的，可以从任何线程调用。
         """
-        current_loop = get_running_loop_safe()
         with self._ready_lock:
             self.call_soon(callback, *args)
+        current_loop = get_running_loop_safe()
         # 仅在跨线程路径需要唤醒事件循环
         if current_loop is not self:
             self._wake_loop()
@@ -1685,7 +1695,7 @@ def wait(
         if wait_future.done():
             return
 
-        pending.remove(task)
+        pending.discard(task)
         done.add(task)
 
         # 检查是否满足返回条件
@@ -1749,7 +1759,7 @@ def wait_for(
         ...     return "done"
         >>> try:
         ...     result = await wait_for(slow_task(), timeout_delay=1.0)
-        ... except AsyncioTimeoutError:
+        ... except AsyncTimeoutError:
         ...     print("Task timed out")
     """
     loop = get_running_loop()
@@ -1770,7 +1780,7 @@ def wait_for(
     def _on_timeout():
         if not done_future.done():
             task.cancel(msg=f"Timeout after {timeout_delay}s")  # 超时自动取消
-            done_future.set_exception(AsyncioTimeoutError())
+            done_future.set_exception(AsyncTimeoutError())
 
     timeout_handle = loop.call_later(timeout_delay, _on_timeout)
 
@@ -1840,7 +1850,7 @@ class _TimeoutContext:
         if self._timer:
             self._timer.cancel()
         if exc_type is FutureCancelledError and self._timed_out:
-            raise AsyncioTimeoutError() from exc_val
+            raise AsyncTimeoutError() from exc_val
 
 
 def timeout(delay: float) -> _TimeoutContext:
@@ -2475,7 +2485,7 @@ class SelectiveLockBase(BaseAsyncLock):
             try:
                 async with timeout(duration):
                     await self._wait_for_ids(target_set)
-            except AsyncioTimeoutError:
+            except AsyncTimeoutError:
                 if force:
                     try:
                         await self._on_force(target_set)
@@ -2725,3 +2735,115 @@ class AsyncLock(AsyncSemaphore):
     def __repr__(self):
         status = "locked" if self.locked() else "unlocked"
         return f"<AsyncLock [{status}] waiters={len(self._waiters)}>"
+
+
+async def stream_from_queue_sentinel(
+    queue: AsyncQueue[_T],
+    end_signal: Union[Task, Event],
+    filter_func: Optional[Callable[[_T], bool]] = None,
+    name: str = "StreamPump",
+) -> AsyncGenerator[_T, None]:
+    """
+    通用异步流式泵：从异步队列中流式获取数据，直到接收到结束信号或哨兵(哨兵模式)。
+
+    该工具函数提供了一种高性能、内存友好的方式来消费异步队列。它结合了“哨兵模式”和“贪婪消费模式”，
+    旨在最大化吞吐量并最小化协程调度开销。
+
+    工作原理：
+    1. 信号监听：通过为 Task 绑定回调或为 Event 绑定等待任务回调，在结束时向队列投放哨兵对象。
+    2. 贪婪消费：进入循环后，优先通过 get_nowait() 排空队列中的所有存量数据，减少 yield 导致的调度切换。
+    3. 阻塞等待：当队列为空时，使用 await queue.get() 挂起，直到下一个结果或哨兵到来。
+    4. 异常传导：运行失败，函数会将异常上抛。
+
+    Args:
+        queue: 要消费的异步队列 (AsyncQueue)。
+        end_signal: 结束信号源，可以是 Task (任务结束) 或 Event (事件设置)。
+        filter_func: 可选的结果过滤函数。如果提供，只有通过过滤的结果才会被 yield。
+        name: 用于描述该流式泵的名称（用于日志和调试）。
+
+    Yields:
+        从队列中获取的原始数据。
+
+    Raises:
+        Exception: 当 end_signal 是 Task 且其执行过程中出现异常时。
+        FutureCancelledError: 当外部显式取消该生成器迭代时。
+    """
+
+    # 局部内部函数，用于安全投放哨兵到队列
+    def safe_put_sentinel(_=None):
+        try:
+            queue.put_nowait(stop_sentinel)
+            logging.debug(f"{name}: Sent sentinel to queue")
+        except QueueFullError:
+            # 如果队列由于某种原因满了，稍后重试，确保哨兵一定能送达
+            try:
+                loop = get_running_loop()
+                logging.warning(f"{name}: Queue full, retrying to put sentinel...")
+                loop.call_soon(safe_put_sentinel)  # noqa
+            except RuntimeError:
+                pass  # 循环可能已关闭
+
+    if not isinstance(end_signal, (Task, Event)):
+        logging.error(f"end_signal type error: {type(end_signal)}")
+        raise TypeError("end_signal must be of Task or Event type")
+    stop_sentinel = object()
+    not_filter = filter_func is None
+    if isinstance(end_signal, Event):
+        task = create_task(end_signal.wait(), name=f"{name}_EventMonitor")
+    else:
+        task = end_signal
+
+    # 挂载完成回调
+    task_name = task.get_name()
+    if task.done():
+        logging.debug(f"{name}: Task {task_name} is done, putting sentinel to queue.")
+        safe_put_sentinel()
+    else:
+        logging.debug(f"{name}: Task {task_name} is not done, waiting for completion.")
+        task.add_done_callback(safe_put_sentinel)
+
+    try:
+        while True:
+            # 1. 尝试获取 item：先尝试非阻塞 grab，失败则转为阻塞 await
+            try:
+                item = queue.get_nowait()
+            except QueueEmptyError:
+                item = await queue.get()
+
+            # 2. 统一处理 item 逻辑
+            if item is stop_sentinel:
+                while True:
+                    try:
+                        n_item = queue.get_nowait()
+                        if not_filter or filter_func(n_item):
+                            yield n_item
+                        queue.task_done()
+                    except QueueEmptyError:
+                        break
+                queue.task_done()
+                # 收到哨兵，检查 Task 异常（如果有）并退出
+                exc = task.exception()
+                if exc:
+                    raise exc
+                return
+
+            if not_filter or filter_func(item):
+                yield item
+            queue.task_done()
+            # logging.debug(f"{name}: Task {item.task_name} consumed.")
+
+    except FutureCancelledError:
+        # 外部取消了迭代
+        logging.error(
+            f"{name}: The general-purpose asynchronous flow pump was manually cancelled."
+        )
+        try:
+            task.cancel()
+            await task
+        except FutureCancelledError:
+            logging.warning(
+                f"{name}: The consumer task {task_name} was cancelled synchronously."
+            )
+        raise
+    finally:
+        logging.info(f"{name}: The general-purpose asynchronous flow pump completed.")
