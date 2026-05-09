@@ -546,19 +546,19 @@ run(main())
 ### 超时控制
 
 ```python
-from simple_asyncio import run, sleep, wait_for, AsyncioTimeoutError
+from simple_asyncio import run, sleep, wait_for, AsyncTimeoutError
 
 
 async def slow_task():
-   await sleep(5)
-   return "完成"
+    await sleep(5)
+    return "完成"
 
 
 try:
-   # 设置 1 秒超时
-   result = run(wait_for(slow_task(), timeout_delay=1.0))
-except AsyncioTimeoutError:
-   print("任务超时！")
+    # 设置 1 秒超时
+    result = run(wait_for(slow_task(), timeout_delay=1.0))
+except AsyncTimeoutError:
+    print("任务超时！")
 ```
 
 ---

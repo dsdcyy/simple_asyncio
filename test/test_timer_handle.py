@@ -120,7 +120,7 @@ async def test_wait_for_timeout():
     print("测试 4: wait_for 超时")
     print("=" * 70)
 
-    from simple_asyncio import wait_for, AsyncioTimeoutError
+    from simple_asyncio import wait_for, AsyncTimeoutError
 
     loop = get_event_loop()
 
@@ -133,7 +133,7 @@ async def test_wait_for_timeout():
         print("  [Main] 等待慢任务（超时 0.2 秒）...")
         result = await wait_for(slow_task(), timeout_delay=0.2)
         print(f"  [Main] 结果: {result}（不应该到达这里）")
-    except AsyncioTimeoutError:
+    except AsyncTimeoutError:
         print("  [Main] ✅ 正确抛出 TimeoutError")
 
     await sleep(0.1)
