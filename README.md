@@ -482,6 +482,29 @@ async def main():
 run(main())
 ```
 
+### 7. 异步流式处理 (Stream Pump)
+将异步队列转换为一个优雅的流式接口，支持自动哨兵（Sentinel）检测和异常传播。
+
+```python
+from simple_asyncio import AsyncQueue, stream_from_queue_sentinel, run, create_task, sleep
+
+async def producer(q):
+    for i in range(3):
+        await q.put(f"Msg-{i}")
+        await sleep(0.5)
+    # 任务结束会自动触发流式泵关闭
+
+async def main():
+    q = AsyncQueue()
+    p_task = create_task(producer(q))
+    
+    # 像处理流一样处理队列，自动感知生产者结束
+    async for item in stream_from_queue_sentinel(q, p_task):
+        print(f"收到流数据: {item}")
+
+run(main())
+```
+
 ## 🎯 高级特性
 
 ### ContextVar 上下文隔离
@@ -511,7 +534,7 @@ assert id(loop1) != id(loop2)  # 不同的循环实例
 ### 任务取消与传播
 
 ```python
-from simple_asyncio import run, sleep, FutureCancelledError, get_running_loop
+from simple_asyncio import run, sleep, CancelledError, get_running_loop
 
 
 async def long_task():
@@ -519,7 +542,7 @@ async def long_task():
       print("开始长任务...")
       await sleep(10)
       return "完成"
-   except FutureCancelledError as e:
+   except CancelledError as e:
       print(f"任务被取消: {e.cancel_msg()}")
       raise  # 必须重新抛出
 
@@ -536,7 +559,7 @@ async def main():
 
    try:
       await task
-   except FutureCancelledError:
+   except CancelledError:
       print("已捕获取消异常")
 
 
@@ -598,6 +621,7 @@ except AsyncTimeoutError:
 | **上下文管理** | `ContextVar` | 自动继承和恢复 |
 | **定时器** | `heapq` 最小堆 | O(log n) 插入/删除 |
 | **任务调度** | `deque` FIFO | O(1) 入队/出队 |
+| **锁索引** | `Dict` + `Set` | O(1) 精准唤醒特定 ID |
 
 ---
 

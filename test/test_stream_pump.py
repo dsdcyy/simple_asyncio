@@ -31,7 +31,7 @@ async def main():
     end_time = time.monotonic()
     print(f"--- 测试完成 ---")
     print(f"总计接收数据: {count} 条 (预期: 5)")
-    print(f"迭代耗时: {end_time - start_time:.2f}s")
+    print(f"迭代耗时: {end_time - start_time:.4f}s")
 
     # 验证队列是否已清空（包括 task_done 的计数）
     await queue.join()
