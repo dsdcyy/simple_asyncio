@@ -2388,41 +2388,36 @@ class SelectiveLockBase(BaseAsyncLock):
         """检查目标 ID 中是否还有活跃的（子类实现）"""
         raise NotImplementedError
 
+    def _remove_waiter(self, entry: WaiterEntry):
+        """将等待者从全局集合和 tid 索引中移除（内部工具）"""
+        self._waiters_all.discard(entry)
+        for tid in entry.target_ids:
+            s = self._waiters.get(tid)
+            if s:
+                s.discard(entry)
+                if not s:
+                    del self._waiters[tid]
+
+    def _try_wake_waiter(self, entry: WaiterEntry) -> bool:
+        """检查等待者是否满足唤醒条件，若满足则唤醒并清理索引"""
+        if not self._is_any_active(entry.target_ids):
+            if not entry.fut.done():
+                entry.fut.set_result(None)
+            self._remove_waiter(entry)
+            return True
+        return False
+
     def _trigger_waiters_check(self):
-        """触发所有局部等待者的状态检查"""
+        """全量检查所有等待者（用于回退或状态恢复）"""
         if not self._waiters_all:
             return
 
-        remaining = set()
-        # 全量扫描：用于回退/强制场景，保持原有语义
+        # 使用 list 拷贝以支持在遍历中移除
         for entry in list(self._waiters_all):
-            if not self._is_any_active(entry.target_ids):
-                if not entry.fut.done():
-                    entry.fut.set_result(None)
-                # remove below
-                self._waiters_all.discard(entry)
-                for tid in entry.target_ids:
-                    s = self._waiters.get(tid)
-                    if s:
-                        s.discard(entry)
-                        if not s:
-                            del self._waiters[tid]
-            else:
-                remaining.add(entry)
-
-        # rebuild map from remaining (defensive: ensure consistency)
-        if remaining:
-            self._waiters_all = remaining
-            self._waiters.clear()
-            for entry in remaining:
-                for tid in entry.target_ids:
-                    self._waiters.setdefault(tid, set()).add(entry)
-        else:
-            self._waiters_all.clear()
-            self._waiters.clear()
+            self._try_wake_waiter(entry)
 
     def _trigger_waiters_for_t_ids(self, t_ids: set[int]):
-        """仅触发与给定 t_ids 有交集的等待者，避免全表扫描"""
+        """精准触发：仅检查受给定 t_ids 影响的等待者"""
         if not self._waiters_all:
             return
 
@@ -2432,51 +2427,30 @@ class SelectiveLockBase(BaseAsyncLock):
             if s:
                 impacted.update(s)
 
-        if not impacted:
-            return
-
         for entry in list(impacted):
-            if not self._is_any_active(entry.target_ids):
-                if not entry.fut.done():
-                    entry.fut.set_result(None)
-                # remove from global set and per-tid index
-                self._waiters_all.discard(entry)
-                for t in entry.target_ids:
-                    s = self._waiters.get(t)
-                    if s:
-                        s.discard(entry)
-                        if not s:
-                            del self._waiters[t]
+            self._try_wake_waiter(entry)
 
     async def _wait_for_ids(self, target_set: set[int]) -> None:
-        """
-        核心等待逻辑（供子类 wait_unlock 调用）。
-        - target_set 为空：全局屏障，等待所有任务完成。
-        - target_set 非空：局部屏障，等待指定 ID 全部不活跃。
-        """
+        """核心挂起逻辑：将协程加入等待队列并阻塞"""
         if not target_set:
             await self._event.wait()
             return
         if not self._is_any_active(target_set):
             return
+
         fut = get_running_loop().create_future()
         entry = WaiterEntry(frozenset(target_set), fut)
-        # insert into global set and per-tid index
+
+        # 注册索引
         self._waiters_all.add(entry)
         for tid in entry.target_ids:
             self._waiters.setdefault(tid, set()).add(entry)
+
         try:
             await fut
         finally:
-            # 清理：从全局集合和索引中移除该 waiter
-            if entry in self._waiters_all:
-                self._waiters_all.discard(entry)
-                for tid in entry.target_ids:
-                    s = self._waiters.get(tid)
-                    if s:
-                        s.discard(entry)
-                        if not s:
-                            del self._waiters[tid]
+            # 无论是因为成功被唤醒还是因为超时/取消，都要确保清理索引
+            self._remove_waiter(entry)
 
     async def _on_force(self, target_set: set[int]) -> None:
         """超时强制清理钩子（子类实现）"""

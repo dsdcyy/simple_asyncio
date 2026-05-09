@@ -1,6 +1,7 @@
 /.vscode/
 /.codex/
 /.agents/
+/.idea/
 */__pycache__/
 __pycache__/
 *.pyc
