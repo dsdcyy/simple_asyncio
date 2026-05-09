@@ -1,5 +1,5 @@
-import sys
 import os
+import sys
 
 # 将当前目录添加到路径中以便导入 simple_asyncio
 sys.path.insert(0, os.getcwd())

@@ -1,5 +1,6 @@
-import simple_asyncio as asyncio
 import time
+
+import simple_asyncio as asyncio
 
 
 async def limited_worker(semaphore, name):

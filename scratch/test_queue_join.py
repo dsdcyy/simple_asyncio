@@ -1,5 +1,5 @@
-import sys
 import os
+import sys
 import time
 
 # 将当前目录添加到路径中以便导入 simple_asyncio

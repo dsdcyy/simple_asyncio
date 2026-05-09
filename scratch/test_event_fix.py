@@ -1,10 +1,10 @@
-import sys
 import os
+import sys
 
 # 将当前目录添加到路径中以便导入 simple_asyncio
 sys.path.insert(0, os.getcwd())
 
-from simple_asyncio import run, sleep, Event, get_event_loop, create_task
+from simple_asyncio import run, sleep, Event, create_task
 
 
 async def test_event_clear():
