@@ -118,9 +118,9 @@ async def main5():
     task3 = loop.create_task(long_task("Task-C"), name="Database-Query")
 
     print(f"\n任务列表:")
-    print(f"  task1.name = {task1.name}")
-    print(f"  task2.name = {task2.name}")
-    print(f"  task3.name = {task3.name}")
+    print(f"  task1.name = {task1._name}")
+    print(f"  task2.name = {task2._name}")
+    print(f"  task3.name = {task3._name}")
 
     # 等待一会儿
     await sleep(0.5)

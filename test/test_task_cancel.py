@@ -24,14 +24,14 @@ async def test_task_name_and_cancel():
     task2 = loop.create_task(worker(2), name="DataFetcher-2")
 
     print(f"\n任务名称:")
-    print(f"  task1.name: {task1.name}")
-    print(f"  task2.name: {task2.name}")
+    print(f"  task1.name: {task1._name}")
+    print(f"  task2.name: {task2._name}")
 
     result1 = await task1
     result2 = await task2
     print(f"\n任务结果:")
-    print(f"  {task1.name}: {result1}")
-    print(f"  {task2.name}: {result2}")
+    print(f"  {task1._name}: {result1}")
+    print(f"  {task2._name}: {result2}")
 
     print("\n✅ 任务命名测试通过！")
 
@@ -53,7 +53,7 @@ async def test_task_name_and_cancel():
 
     # 等待 1.5 秒后取消
     await sleep(1.5)
-    print(f"\n[主协程] 取消任务 {task3.name}...")
+    print(f"\n[主协程] 取消任务 {task3._name}...")
     result = task3.cancel(msg="用户主动取消")
     print(f"[主协程] cancel 返回值: {result}")
 

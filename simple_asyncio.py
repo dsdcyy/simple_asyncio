@@ -49,31 +49,44 @@ from typing import (
 )
 
 __all__ = (
-    "EventLoop",
-    "Task",
-    "Future",
-    "TimerHandle",
+    "ALL_COMPLETED",
+    "AsyncCountdownLock",
+    "AsyncLock",
+    "AsyncQueue",
+    "AsyncSelectiveLock",
+    "AsyncSemaphore",
     "AsyncSocket",
-    "sleep",
-    "gather",
-    "wait",
-    "wait_for",
+    "AsyncTimeoutError",
+    "AsyncToggleLock",
+    "BaseAsyncLock",
+    "Event",
+    "EventLoop",
+    "FIRST_COMPLETED",
+    "FIRST_EXCEPTION",
+    "FutureCancelledError",
+    "QueueEmptyError",
+    "QueueFullError",
+    "SelectiveLockBase",
+    "Task",
+    "ThreadFuture",
+    "TimerHandle",
+    "WaiterEntry",
+    "YieldControl",
     "create_task",
-    "run",
+    "gather",
     "get_event_loop",
     "get_running_loop",
-    "Event",
-    "AsyncQueue",
-    "AsyncCountdownLock",
-    "AsyncSelectiveLock",
-    "AsyncToggleLock",
-    "AsyncSemaphore",
-    "AsyncLock",
     "get_running_loop_safe",
-    "FutureCancelledError",
-    "AsyncTimeoutError",
+    "logger",
+    "run",
+    "sleep",
+    "stream_from_queue_sentinel",
+    "timeout",
+    "wait",
+    "wait_for",
     "yield_control",
 )
+
 logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 # 使用 ContextVar 存储当前事件循环（线程安全、协程安全）
@@ -391,8 +404,8 @@ class Task(Future[_T]):
     它管理任务的调度、取消和完成状态。
 
     Attributes:
-        gen: 被包装的生成器或协程对象
-        name: 任务名称（用于调试和日志）
+        _gen: 被包装的生成器或协程对象
+        _name: 任务名称（用于调试和日志）
         _next_value: 下一次发送给生成器的值
         _stepping: 是否正在执行 _step（防止重入）
         _rescheduled: 是否已重新调度（处理重入情况）
@@ -400,8 +413,8 @@ class Task(Future[_T]):
     """
 
     __slots__ = (
-        "gen",
-        "name",
+        "_gen",
+        "_name",
         "_next_value",
         "_stepping",
         "_rescheduled",
@@ -424,8 +437,8 @@ class Task(Future[_T]):
             name: 任务名称（可选，未提供则自动生成）
         """
         super().__init__(loop)
-        self.gen = gen
-        self.name = name or f"Task-{id(self)}"  # 任务名称
+        self._gen = gen
+        self._name = name or f"Task-{id(self)}"  # 任务名称
         # 启动生成器，并处理它遇到的第一个 yield
         self._loop.call_soon(self._step)
         self._next_value: Any = None
@@ -442,7 +455,7 @@ class Task(Future[_T]):
         Returns:
             str: 任务名称
         """
-        return self.name
+        return self._name
 
     def _on_done(self, f: Future) -> None:
         """
@@ -574,16 +587,16 @@ class Task(Future[_T]):
 
         try:
             if is_exc:
-                yielded = self.gen.throw(value)
+                yielded = self._gen.throw(value)
             elif self._cancelled:
                 self._cancelled = False
                 self._next_value = None  # 清掉 resume 值（关键！）
-                yielded = self.gen.throw(FutureCancelledError(self._cancel_msg))
+                yielded = self._gen.throw(FutureCancelledError(self._cancel_msg))
 
             else:
                 send_value = self._next_value
                 self._next_value = None
-                yielded = self.gen.send(send_value)
+                yielded = self._gen.send(send_value)
         except StopIteration as e:
             self.set_result(e.value)  # 正常结束，返回值作为结果
             return
@@ -1658,7 +1671,7 @@ def gather(
             failed = True
             for other in tasks:
                 if not other.done():
-                    other.cancel(msg=f"Gather failed due to task {other.name}")
+                    other.cancel(msg=f"Gather failed due to task {other._name}")
             all_done.set_exception(e)
 
     def on_gather_cancel(f: Future):
@@ -2387,14 +2400,29 @@ class AsyncQueue(Generic[_T]):
 
 
 class WaiterEntry:
-    __slots__ = ("target_ids", "fut")
+    __slots__ = ("target_ids", "fut", "count")
 
-    def __init__(self, target_ids: frozenset, fut: Future[None]):
+    def __init__(
+        self,
+        target_ids: frozenset,
+        fut: Future[None] | None,
+        count: Optional[int] = None,
+    ):
+        """
+        初始化等待者条目。
+
+        Args:
+            target_ids: 目标 ID 集合
+            count: 需要解锁的 ID 数量（默认全部）
+            fut: 完成时触发的 Future，或 None 表示无触发
+        """
         self.target_ids: frozenset[int] = target_ids
-        self.fut: Future[None] = fut
+        self.fut: Future[None] | None = fut
+        # 若未指定 count，则默认需要全部 ID 解锁 (即解锁数量 >= 总数)
+        self.count: int = count if count is not None else len(target_ids)
 
     def __repr__(self) -> str:
-        return f"_WaiterEntry(target_ids={self.target_ids}, fut={self.fut})"
+        return f"_WaiterEntry(target_ids={self.target_ids}, fut={self.fut}, count={self.count})"
 
 
 class SelectiveLockBase(BaseAsyncLock):
@@ -2434,9 +2462,13 @@ class SelectiveLockBase(BaseAsyncLock):
                 if not s:
                     del self._waiters[tid]
 
+    def _is_condition_met(self, entry: WaiterEntry) -> bool:
+        """检查等待者是否满足唤醒条件（子类实现）"""
+        return not self._is_any_active(entry.target_ids)
+
     def _try_wake_waiter(self, entry: WaiterEntry) -> bool:
         """检查等待者是否满足唤醒条件，若满足则唤醒并清理索引"""
-        if not self._is_any_active(entry.target_ids):
+        if self._is_condition_met(entry):
             if not entry.fut.done():
                 entry.fut.set_result(None)
             self._remove_waiter(entry)
@@ -2466,16 +2498,21 @@ class SelectiveLockBase(BaseAsyncLock):
         for entry in list(impacted):
             self._try_wake_waiter(entry)
 
-    async def _wait_for_ids(self, target_set: set[int]) -> None:
+    async def _wait_for_ids(
+        self, target_set: set[int], count: Optional[int] = None
+    ) -> None:
         """核心挂起逻辑：将协程加入等待队列并阻塞"""
         if not target_set:
             await self._event.wait()
             return
-        if not self._is_any_active(target_set):
+
+        # 初始检查
+        entry_temp = WaiterEntry(frozenset(target_set), None, count)
+        if self._is_condition_met(entry_temp):
             return
 
         fut = get_running_loop().create_future()
-        entry = WaiterEntry(frozenset(target_set), fut)
+        entry = WaiterEntry(frozenset(target_set), fut, count)
 
         # 注册索引
         self._waiters_all.add(entry)
@@ -2631,6 +2668,49 @@ class AsyncSelectiveLock(SelectiveLockBase):
         if not self._active_ids:
             self._wake_up()
 
+    def _is_condition_met(self, entry: WaiterEntry) -> bool:
+        """精准检查解锁数量是否达到阈值"""
+        locked_ids = self.locked_ids(entry.target_ids)
+        available_count = len(entry.target_ids) - len(locked_ids)
+        return available_count >= entry.count
+
+    async def wait_count(
+        self,
+        target_ids: Union[list[int], set[int]],
+        count: int,
+        duration: Optional[float] = None,
+        force: bool = False,
+    ) -> set[int]:
+        """
+        等待 target_ids 中的至少 count 个 ID 处于解锁状态。
+
+        Args:
+            target_ids: 关注的 ID 集合
+            count: 期望解锁的最小数量
+            duration: 最大等待时间
+            force: 超时是否强制解锁
+
+        Returns:
+            set[int]: 当前已解锁的 ID 集合
+        """
+        target_set = set(target_ids)
+        if count > len(target_set):
+            raise ValueError("count cannot be greater than the number of target_ids")
+
+        if duration is not None:
+            try:
+                async with timeout(duration):
+                    await self._wait_for_ids(target_set, count=count)
+            except AsyncTimeoutError:
+                if force:
+                    await self._on_force(target_set)
+                raise
+        else:
+            await self._wait_for_ids(target_set, count=count)
+
+        # 返回当前已解锁的 ID
+        return target_set - self.locked_ids(target_set)
+
     def trace_task(self, task: Task) -> int:
         """追踪 Task 对象生命周期并返回其唯一追踪 ID"""
         tid = self.acquire()
@@ -2679,7 +2759,9 @@ class AsyncSelectiveLock(SelectiveLockBase):
         """获取当前所有活跃（锁定）的 ID 集合拷贝"""
         return set(self._active_ids)
 
-    def locked_ids(self, target_ids: Union[list[int], set[int]]) -> set[int]:
+    def locked_ids(
+        self, target_ids: Union[list[int], set[int], frozenset[int]]
+    ) -> set[int]:
         """
         查询指定的多个 ID 是否还在锁定状态。
 
