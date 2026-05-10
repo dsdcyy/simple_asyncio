@@ -3,7 +3,7 @@ import time
 import simple_asyncio as asyncio
 
 
-async def worker(lock, name, delay):
+async def worker(lock: asyncio.AsyncSelectiveLock, name: str, delay: float):
     # 使用上下文管理器自动获取和释放 ID
     async with lock as tid:
         print(
@@ -13,11 +13,20 @@ async def worker(lock, name, delay):
         print(f"[{time.strftime('%H:%M:%S')}] 任务 {name} (ID: {tid}) 完成")
 
 
+async def print_lock_info(lock: asyncio.AsyncSelectiveLock):
+    while True:
+        print(f"[{time.strftime('%H:%M:%S')}] 当前活跃 ID: {lock.active_ids}")
+        print(
+            f"[{time.strftime('%H:%M:%S')}] 当前锁定 ID: {lock.locked_ids([1, 2, 3, 4])}"
+        )
+        await asyncio.sleep(1)
+
+
 async def main():
     lock = asyncio.AsyncSelectiveLock()
 
     print("--- 开始测试 AsyncSelectiveLock ---")
-
+    print_task = asyncio.create_task(print_lock_info(lock))
     # 1. 启动一系列不同耗时的任务
     # ID 将依次为 1, 2, 3, 4
     asyncio.gather(
@@ -47,7 +56,7 @@ async def main():
     print(
         f"[{time.strftime('%H:%M:%S')}] 【观察者 B】醒了！耗时 {end_b - start_a:.2f}s (预期约 4s)"
     )
-
+    print_task.cancel()
     print("--- 测试完成 ---")
 
 

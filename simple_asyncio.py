@@ -735,11 +735,14 @@ class EventLoop:
     def __init__(self) -> None:
         """
         初始化事件循环
-
         创建必要的数据结构和自唤醒管道。
         """
-        self._ready: deque = deque()  # 就绪回调队列
-        self._scheduled: list = []  # 最小堆，存 (deadline, seq, handler)
+        self._ready: deque[tuple[Callable[..., Any], Tuple[Any, ...]]] = (
+            deque()
+        )  # 就绪回调队列
+        self._scheduled: list[tuple[float, int, TimerHandle]] = (
+            []
+        )  # 最小堆，存 (deadline, seq, handler)
         self._timer_seq = 0
         self._running = False
         self._tasks: Set[Task] = set()
@@ -957,6 +960,8 @@ class EventLoop:
         Note:
             此方法不是线程安全的。从其他线程调用应使用 call_soon_threadsafe。
         """
+        if self._closed:
+            raise RuntimeError("Event loop is closed")
         self._ready.append((callback, args))
 
     def call_later(
@@ -979,6 +984,8 @@ class EventLoop:
             >>> handle = loop.call_later(1.0, print, "Hello")
             >>> handle.cancel()  # 取消定时器
         """
+        if self._closed:
+            raise RuntimeError("Event loop is closed")
         deadline = time.monotonic() + delay
         self._timer_seq += 1
         handler = TimerHandle(callback, args, self, deadline)
@@ -987,7 +994,7 @@ class EventLoop:
 
     def add_reader(
         self,
-        fileobj: int,
+        fileobj: int | socket.socket,
         callback: Callable[..., Any],
         *args: Any,
         one_shot: bool = False,
@@ -1005,7 +1012,7 @@ class EventLoop:
 
     def add_writer(
         self,
-        fileobj: int,
+        fileobj: int | socket.socket,
         callback: Callable[..., Any],
         *args: Any,
         one_shot: bool = False,
@@ -1021,7 +1028,7 @@ class EventLoop:
         """
         self._add_io_callback("write", fileobj, callback, args, one_shot)
 
-    def remove_reader(self, fileobj: int) -> None:
+    def remove_reader(self, fileobj: int | socket.socket) -> None:
         """
         移除文件描述符的可读事件
 
@@ -1030,7 +1037,7 @@ class EventLoop:
         """
         self._remove_io_callbacks("read", fileobj)
 
-    def remove_writer(self, fileobj: int) -> None:
+    def remove_writer(self, fileobj: int | socket.socket) -> None:
         """
         移除文件描述符的可写事件
 
@@ -1039,14 +1046,14 @@ class EventLoop:
         """
         self._remove_io_callbacks("write", fileobj)
 
-    def _fd(self, fileobj: int) -> int:
+    def _fd(self, fileobj: int | socket.socket) -> int:
         """返回文件描述符整数。"""
         return fileobj if isinstance(fileobj, int) else fileobj.fileno()
 
     def _add_io_callback(
         self,
         direction: str,
-        fileobj: int,
+        fileobj: int | socket.socket,
         callback: Callable[..., Any],
         args: Tuple[Any, ...],
         one_shot: bool,
@@ -1102,7 +1109,9 @@ class EventLoop:
             except KeyError:
                 pass
 
-    def _remove_io_callbacks(self, direction: str, fileobj: int) -> None:
+    def _remove_io_callbacks(
+        self, direction: str, fileobj: int | socket.socket
+    ) -> None:
         """内部：清空 direction 的回调并根据剩余回调修改或注销 selector 注册。"""
         fd = self._fd(fileobj)
         try:
@@ -1114,7 +1123,7 @@ class EventLoop:
         self._update_selector_registration(fd, data)
 
     def _remove_specific_io_callback(
-        self, direction: str, fileobj: int, callback: Callable[..., Any]
+        self, direction: str, fileobj: int | socket.socket, callback: Callable[..., Any]
     ) -> None:
         """内部：从 direction 列表中移除指定回调（按函数对象匹配）。"""
         fd = self._fd(fileobj)
@@ -1130,7 +1139,7 @@ class EventLoop:
 
     def add_reader_threadsafe(
         self,
-        fileobj: int,
+        fileobj: int | socket.socket,
         callback: Callable[..., Any],
         *args: Any,
         one_shot: bool = False,
@@ -1143,7 +1152,7 @@ class EventLoop:
 
     def add_writer_threadsafe(
         self,
-        fileobj: int,
+        fileobj: int | socket.socket,
         callback: Callable[..., Any],
         *args: Any,
         one_shot: bool = False,
@@ -1154,7 +1163,7 @@ class EventLoop:
         )
 
     def remove_reader_callback(
-        self, fileobj: int, callback: Callable[..., Any]
+        self, fileobj: int | socket.socket, callback: Callable[..., Any]
     ) -> None:
         """从 `fileobj` 的可读回调列表中移除指定回调（非线程安全）。"""
         self._remove_specific_io_callback("read", fileobj, callback)
@@ -1168,7 +1177,7 @@ class EventLoop:
         )
 
     def remove_writer_callback(
-        self, fileobj: int, callback: Callable[..., Any]
+        self, fileobj: int | socket.socket, callback: Callable[..., Any]
     ) -> None:
         """从 `fileobj` 的可写回调列表中移除指定回调（非线程安全）。"""
         self._remove_specific_io_callback("write", fileobj, callback)
@@ -1290,14 +1299,17 @@ class EventLoop:
     def run_until_complete(self, main_task: Task[_T]) -> _T:
         self._running = True
         main_task.add_done_callback(lambda _: self.stop())
-        self._run_once(main_task)  # 主循环（直到主任务完成）
+        self._run_loop(main_task)  # 第一阶段：主循环（直到主任务完成）
 
         # 取消所有其他未完成的任务
         self._cancel_other_tasks(main_task)
 
+        # 第二阶段：清理循环。
+        # 此时 main_task 已经 done，我们需要继续运行循环直到 self._tasks 为空
+        # 以确保所有任务的 CancelledError 和 finally 块执行完毕。
         if self._tasks:
             self._running = True
-            self._run_once(main_task)
+            self._run_loop(None)
         return main_task.result()
 
     def _report_error(self, message: str, exc: Optional[Exception], **kwargs) -> None:
@@ -1322,7 +1334,7 @@ class EventLoop:
         except Exception as e:
             self._report_error("Exception in callback", e, callback=cb, args=args)
 
-    def _dispatch_selector_event(self, key, mask) -> None:
+    def _dispatch_selector_event(self, key: selectors.SelectorKey, mask: int) -> None:
         """
         将 selector 事件的分发逻辑提取出来，统一处理 read/write 列表中的回调。
 
@@ -1378,77 +1390,91 @@ class EventLoop:
         # 更新 selector 注册（封装以避免重复代码）
         self._update_selector_registration(fd, data)
 
-    def _run_once(self, main_task: Task):
-        while self._running:
-            # 核心退出条件：如果主任务已完成，且没有其他后台任务正在运行、没有就绪队列里的任务（常用于清理阶段）
-            if main_task.done() and not self._tasks and not self._ready:
+    def _flush_ready(self) -> None:
+        """原子化地取出当前所有就绪的回调并执行。"""
+        if not self._ready:
+            return
+
+        with self._ready_lock:
+            ready_to_process = self._ready
+            self._ready = deque()
+
+        while ready_to_process:
+            cb, args = ready_to_process.popleft()
+            self._complete_a_task(cb, *args)
+
+    def _run_loop(self, main_task: Optional[Task] = None):
+        """
+        核心循环驱动引擎。
+
+        该方法通过 while True 持续驱动事件循环，直到满足特定的退出条件。它支持两种运行模式：
+        1. 主任务模式 (main_task is not None): 运行直到该任务完成。
+        2. 清理模式 (main_task is None): 运行直到所有后台任务 (self._tasks) 彻底清空。
+
+        退出判定优先级：
+        - 显式停止：self.stop() 被调用且就绪队列已排空。
+        - 模式驱动：主任务完成或所有后台任务处理完毕（包括 finally 块产生的收尾任务）。
+
+        Args:
+            main_task: 可选的目标任务。如果提供，循环将以该任务的完成为首要退出信号。
+        """
+        while True:
+            # 核心退出判定：
+            should_break = False
+            if not self._ready:
+                if not self._running:
+                    should_break = True
+                elif main_task and main_task.done():
+                    should_break = True
+                elif not self._tasks:
+                    should_break = True
+
+            if should_break:
+                # --- 最终防御：快照式排空就绪队列 ---
+                self._flush_ready()
                 break
 
-            # 1. 获取当前时间戳（每一轮循环开始时更新）
-            now = time.monotonic()
+            # --- 2. 动力源阶段 ---
+            # 如果循环已经 stop，则跳过所有外部 I/O 和定时器，只求排空存量就绪任务
+            if self._running:
+                now = time.monotonic()
 
-            # 局部绑定常用属性以减少属性查找开销
-            selector = self._selector
-            select = selector.select
-            get_map = selector.get_map
-            ready_lock = self._ready_lock
+                # 2.1 检查定时器
+                while self._scheduled and self._scheduled[0][0] <= now:
+                    _, _, handler = heapq.heappop(self._scheduled)
+                    if handler.cancelled():
+                        continue
+                    handler.run()
 
-            # 2. 检查定时器是否到期，移到就绪队列
-            while self._scheduled and self._scheduled[0][0] <= now:
-                _, _, handler = heapq.heappop(self._scheduled)
-                if handler.cancelled():
-                    continue
-                handler.run()
-            _timeout: float | None = None
-            if self._ready:
-                _timeout = 0.0
-            elif self._scheduled:
-                _timeout = max(self._scheduled[0][0] - now, 0.0)
-            elif len(get_map()) <= 1:
-                # 只剩自唤醒管道时，仍可能等待其他线程提交回调。
-                # 某些受限环境可能禁止跨线程写 socketpair，保留短轮询兜底。
-                _timeout = self._thread_wakeup_poll_interval
-            # 获取selector的事件列表
-            events = select(_timeout)
-            for key, mask in events:
-                # 将事件处理委托到单独方法，减少重复并提高可测性
-                try:
-                    self._dispatch_selector_event(key, mask)
-                except Exception as e:
-                    self._report_error(
-                        "Exception while dispatching selector event",
-                        e,
-                        key=key,
-                        mask=mask,
-                    )
-            # 4. 执行所有就绪队列里的回调（批量交换以减少锁持有时间）
-            with ready_lock:
+                # 2.2 计算 Select 超时时间
+                _timeout: float | None = None
                 if self._ready:
-                    ready_to_process = self._ready
-                    self._ready = deque()
-                else:
-                    ready_to_process = None
+                    _timeout = 0.0
+                elif self._scheduled:
+                    _timeout = max(self._scheduled[0][0] - now, 0.0)
+                elif len(self._selector.get_map()) <= 1:
+                    _timeout = self._thread_wakeup_poll_interval
 
-            if ready_to_process:
-                while ready_to_process:
-                    cb, args = ready_to_process.popleft()
-                    self._complete_a_task(cb, *args)
+                # 2.3 监听 I/O 事件
+                events = self._selector.select(_timeout)
+                for key, mask in events:
+                    try:
+                        self._dispatch_selector_event(key, mask)
+                    except Exception as e:
+                        self._report_error(
+                            "Exception while dispatching selector event",
+                            e,
+                            key=key,
+                            mask=mask,
+                        )
 
-            # 5. 决定是继续干活还是休息
-            # 如果已经停止运行（如主任务已完成），或者还有就绪任务，则不再进入休眠
+            # --- 3. 执行阶段 ---
+            self._flush_ready()
+
+            # --- 4. 动力源衔接与防御性退出 ---
+            # 如果循环已经停止 (stop() 被调用)，处理完这一波 ready 任务后必须退出
             if not self._running:
                 break
-
-            if self._ready:
-                continue  # 有就绪任务，继续处理
-            # if not self._scheduled:
-            #     # 检查 IO 状态：如果只剩下自唤醒管道 (Self-Pipe) 还在监听，说明已无实际 IO 任务
-            #     if len(self._selector.get_map()) <= 1:
-            #         if not main_task.done():
-            #             raise RuntimeError("Loop stopped before task completed")
-            #         break
-            # 即使当前没有定时器或真实 I/O，也可能有其他线程稍后通过
-            # call_soon_threadsafe 写入 self-pipe 唤醒循环，因此继续等待 selector。
 
     def _cancel_other_tasks(self, main_task):
         for t in list(self._tasks):
@@ -2647,6 +2673,23 @@ class AsyncSelectiveLock(SelectiveLockBase):
 
             if not self._active_ids:
                 self._wake_up()
+
+    @property
+    def active_ids(self) -> set[int]:
+        """获取当前所有活跃（锁定）的 ID 集合拷贝"""
+        return set(self._active_ids)
+
+    def locked_ids(self, target_ids: Union[list[int], set[int]]) -> set[int]:
+        """
+        查询指定的多个 ID 是否还在锁定状态。
+
+        Args:
+            target_ids: 要查询的 ID 集合。
+
+        Returns:
+            set[int]: 传入 ID 中依然处于锁定状态的子集。
+        """
+        return set(target_ids) & self._active_ids
 
     def is_locked(self, task_id: Optional[int] = None) -> bool:
         """检查状态：若指定 id 则检查特定任务，否则检查全局锁"""
