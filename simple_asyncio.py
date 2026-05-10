@@ -1671,7 +1671,7 @@ def gather(
             failed = True
             for other in tasks:
                 if not other.done():
-                    other.cancel(msg=f"Gather failed due to task {other._name}")
+                    other.cancel(msg=f"Gather failed due to task {other.get_name()}")
             all_done.set_exception(e)
 
     def on_gather_cancel(f: Future):
