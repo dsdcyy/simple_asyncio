@@ -2605,31 +2605,60 @@ class SelectiveLockBase(BaseAsyncLock):
         target_ids: Union[list[int], set[int], None] = None,
         duration: Optional[float] = None,
         force: bool = False,
-    ):
+    ) -> None:
         """
-        等待解锁。
+        等待解锁。支持局部等待（指定 ID）或全局等待（target_ids=None）。
         Args:
-        - target_ids=None: 全局屏障，等待所有 ID 完成。
-        - target_ids=[...]: 局部屏障，只要指定 ID 完成即放行。
-        - duration: 超时等待时间（秒）。
-        - force: 若超时，是否调用 _on_force 执行强制清理。
+            target_ids: 全局屏障，等待所有 ID 完成。
+            target_ids: 局部屏障，只要指定 ID 完成即放行。
+            duration: 超时等待时间（秒）。
+            force: 若超时，是否调用 _on_force 执行强制清理。
+        """
+        await self.wait_count(target_ids, count=None, duration=duration, force=force)
+
+    async def wait_count(
+        self,
+        target_ids: Union[list[int], set[int], None],
+        count: Optional[int] = None,
+        duration: Optional[float] = None,
+        force: bool = False,
+    ) -> set[int]:
+        """
+        等待 target_ids 中的至少 count 个 ID 处于解锁状态。
+
+        Args:
+            target_ids: 关注的 ID 集合，None 表示全局等待所有 ID。
+            count: 期望解锁的最小数量,target_ids=None 时无效,默认等待所有 ID 解锁
+            duration: 最大等待时间（秒）。
+            force: 若超时，是否调用 _on_force 执行强制解锁。
+
+        Returns:
+            set[int]: 当前已解锁的 ID 集合
         """
         target_set = set(target_ids) if target_ids is not None else set()
+
+        # 确定期望解锁的数量（全局模式下该值不生效）
+        real_count = count if count is not None else len(target_set)
+        if target_ids is not None and real_count > len(target_set):
+            raise ValueError("count cannot be greater than the number of target_ids")
+
         if duration is not None:
             try:
                 async with timeout(duration):
-                    await self._wait_for_ids(target_set)
+                    await self._wait_for_ids(target_set, count=real_count)
             except AsyncTimeoutError:
                 if force:
-                    try:
-                        await self._on_force(target_set)
-                    except Exception as e:
-                        logging.error(
-                            f"{self.__class__.__name__}: Error during force action: {e}"
-                        )
+                    await self._on_force(target_set)
                 raise
         else:
-            await self._wait_for_ids(target_set)
+            await self._wait_for_ids(target_set, count=real_count)
+
+        # 返回当前已解锁的 ID
+        return self._get_unlocked_ids(target_set)
+
+    def _get_unlocked_ids(self, target_set: set[int]) -> set[int]:
+        """钩子方法：返回已解锁的 ID 集合（子类重写以支持返回值）"""
+        return set()
 
     def acquire(self, task_identifier: Any) -> int:
         """
@@ -2739,47 +2768,8 @@ class AsyncSelectiveLock(SelectiveLockBase):
         if not self._active_ids:
             self._wake_up()
 
-    def _is_condition_met(self, entry: WaiterEntry) -> bool:
-        """精准检查解锁数量是否达到阈值"""
-        locked_ids = self.locked_ids(entry.target_ids)
-        available_count = len(entry.target_ids) - len(locked_ids)
-        return available_count >= entry.count
-
-    async def wait_count(
-        self,
-        target_ids: Union[list[int], set[int]],
-        count: int,
-        duration: Optional[float] = None,
-        force: bool = False,
-    ) -> set[int]:
-        """
-        等待 target_ids 中的至少 count 个 ID 处于解锁状态。
-
-        Args:
-            target_ids: 关注的 ID 集合
-            count: 期望解锁的最小数量
-            duration: 最大等待时间
-            force: 超时是否强制解锁
-
-        Returns:
-            set[int]: 当前已解锁的 ID 集合
-        """
-        target_set = set(target_ids)
-        if count > len(target_set):
-            raise ValueError("count cannot be greater than the number of target_ids")
-
-        if duration is not None:
-            try:
-                async with timeout(duration):
-                    await self._wait_for_ids(target_set, count=count)
-            except AsyncTimeoutError:
-                if force:
-                    await self._on_force(target_set)
-                raise
-        else:
-            await self._wait_for_ids(target_set, count=count)
-
-        # 返回当前已解锁的 ID
+    def _get_unlocked_ids(self, target_set: set[int]) -> set[int]:
+        """精准计算并返回当前已解锁的 ID 集合"""
         return target_set - self.locked_ids(target_set)
 
     def trace_task(self, task: Task) -> int:
@@ -2824,6 +2814,12 @@ class AsyncSelectiveLock(SelectiveLockBase):
 
             if not self._active_ids:
                 self._wake_up()
+
+    def _is_condition_met(self, entry: WaiterEntry) -> bool:
+        """精准检查解锁数量是否达到阈值"""
+        locked_ids = self.locked_ids(entry.target_ids)
+        available_count = len(entry.target_ids) - len(locked_ids)
+        return available_count >= entry.count
 
     @property
     def active_ids(self) -> set[int]:
