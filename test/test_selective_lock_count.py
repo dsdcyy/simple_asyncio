@@ -10,12 +10,9 @@ from simple_asyncio import AsyncSelectiveLock, sleep, run, get_running_loop
 
 
 async def worker(lock: AsyncSelectiveLock, worker_id: int):
-    # 模拟任务加锁
-    # lock.acquire(worker_id)
     # print(f"任务 {worker_id} 启动...")
     duration = random.uniform(0.1, 1)
     await sleep(duration)
-    # lock.release(worker_id)
     print(f"任务 {worker_id} 释放 (耗时 {duration:.2f}s 为模拟延迟)")
 
 

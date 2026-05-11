@@ -2506,21 +2506,23 @@ class SelectiveLockBase(BaseAsyncLock):
             await self._event.wait()
             return
 
-        # 初始检查
-        entry_temp = WaiterEntry(frozenset(target_set), None, count)
-        if self._is_condition_met(entry_temp):
+        # 1. 创建等待条目（初始不带 Future，尽量延迟创建）
+        entry = WaiterEntry(frozenset(target_set), None, count)
+
+        # 2. 初始检查：如果当前已满足阈值，则无需挂起，直接返回
+        if self._is_condition_met(entry):
             return
 
-        fut = get_running_loop().create_future()
-        entry = WaiterEntry(frozenset(target_set), fut, count)
+        # 3. 补票：创建 Future 并关联到 entry
+        entry.fut = get_running_loop().create_future()
 
-        # 注册索引
+        # 4. 注册索引（仅在确定需要挂起时执行）
         self._waiters_all.add(entry)
         for tid in entry.target_ids:
             self._waiters.setdefault(tid, set()).add(entry)
 
         try:
-            await fut
+            await entry.fut
         finally:
             # 无论是因为成功被唤醒还是因为超时/取消，都要确保清理索引
             self._remove_waiter(entry)
