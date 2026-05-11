@@ -233,6 +233,20 @@ class Future(Generic[_T]):
         self._callbacks: List[Callable[["Future"], Any]] = []
         self._loop = loop or get_running_loop()
 
+    def reset(self, loop: "EventLoop") -> None:
+        """
+        重置 Future 状态以便对象池复用
+        Notes:
+            重置应发生于每次 Future 重用前。
+        """
+        self._loop = loop
+        self._result = None
+        self._exception = None
+        self._done = False
+        self._cancelled = False
+        self._cancel_msg = None
+        self._callbacks.clear()
+
     def _check_done(self, check_true: bool = True) -> None:
         """
         检查 Future 的完成状态
@@ -764,6 +778,7 @@ class EventLoop:
         self._execute_pool: Optional[ThreadPoolExecutor] = None
         self._ready_lock = threading.Lock()  # 保护 _ready 的线程锁
         self._closed = False  # 标记是否已关闭
+        self._future_pool: deque[Future] = deque(maxlen=2048)  # 信号 Future 对象池
         self._thread_wakeup_poll_interval = (
             0.01  # self-pipe 被限制时的跨线程唤醒兜底轮询间隔
         )
@@ -816,6 +831,9 @@ class EventLoop:
         self._self_reader.close()
         self._self_writer.close()
         self._selector.close()
+
+        # 清理对象池，打断循环引用
+        self._future_pool.clear()
 
         # 关闭线程池
         if self._execute_pool is not None:
@@ -1496,6 +1514,20 @@ class EventLoop:
 
     def stop(self):
         self._running = False
+
+    def acquire_future(self) -> Future:
+        """从对象池中获取一个洗干净的 Future（内部使用）"""
+        if self._future_pool:
+            fut = self._future_pool.pop()
+            fut.reset(self)
+            return fut
+        return Future(self)
+
+    def release_future(self, fut: Future) -> None:
+        """将内部使用的 Future 归还到对象池"""
+        # 只有真正完成或被取消的 Future 才有资格回收，且要确保没有悬空回调
+        if fut.done() or fut.cancelled():
+            self._future_pool.append(fut)
 
     def ensure_task(
         self,
@@ -2400,26 +2432,53 @@ class AsyncQueue(Generic[_T]):
 
 
 class WaiterEntry:
+    """
+    就绪等待者条目，采用对象池技术减少频繁分配开销。
+    """
+
     __slots__ = ("target_ids", "fut", "count")
+    _pool: deque["WaiterEntry"] = deque(maxlen=1024)
 
     def __init__(
         self,
-        target_ids: frozenset,
-        fut: Future[None] | None,
+        target_ids: Optional[frozenset] = None,
+        fut: Optional[Future[None]] = None,
         count: Optional[int] = None,
     ):
-        """
-        初始化等待者条目。
+        self.target_ids: Optional[frozenset[int]] = target_ids
+        self.fut: Optional[Future[None]] = fut
+        self.count: int = (
+            count if count is not None else (len(target_ids) if target_ids else 0)
+        )
 
-        Args:
-            target_ids: 目标 ID 集合
-            count: 需要解锁的 ID 数量（默认全部）
-            fut: 完成时触发的 Future，或 None 表示无触发
-        """
-        self.target_ids: frozenset[int] = target_ids
-        self.fut: Future[None] | None = fut
-        # 若未指定 count，则默认需要全部 ID 解锁 (即解锁数量 >= 总数)
-        self.count: int = count if count is not None else len(target_ids)
+    @classmethod
+    def acquire(
+        cls,
+        target_ids: frozenset,
+        fut: Optional[Future[None]],
+        count: Optional[int] = None,
+    ) -> "WaiterEntry":
+        """从对象池获取或创建新的等待者条目"""
+        if cls._pool:
+            entry = cls._pool.pop()
+            entry.target_ids = target_ids
+            entry.fut = fut
+            entry.count = count if count is not None else len(target_ids)
+            return entry
+        return cls(target_ids, fut, count)
+
+    def release(self) -> None:
+        """重置状态并归还到对象池"""
+        self.target_ids = None
+        self.fut = None
+        self.count = 0
+        # deque(maxlen=...) 会自动处理容量，这里直接 append
+        self.__class__._pool.append(self)
+
+    @classmethod
+    def clear_pool(cls) -> None:
+        """清空全局对象池"""
+        cls._pool.clear()
 
     def __repr__(self) -> str:
         return f"_WaiterEntry(target_ids={self.target_ids}, fut={self.fut}, count={self.count})"
@@ -2453,7 +2512,11 @@ class SelectiveLockBase(BaseAsyncLock):
         raise NotImplementedError
 
     def _remove_waiter(self, entry: WaiterEntry):
-        """将等待者从全局集合和 tid 索引中移除（内部工具）"""
+        """将等待者从全局集合和 tid 索引中移除，并将其归还对象池"""
+        # 如果已经释放（target_ids 为 None），则直接返回，防止双重归还
+        if entry.target_ids is None:
+            return
+
         self._waiters_all.discard(entry)
         for tid in entry.target_ids:
             s = self._waiters.get(tid)
@@ -2461,6 +2524,13 @@ class SelectiveLockBase(BaseAsyncLock):
                 s.discard(entry)
                 if not s:
                     del self._waiters[tid]
+
+        # ✅ 回收关联的信号 Future (如果有)
+        if entry.fut:
+            self._loop.release_future(entry.fut)
+
+        # ✅ 将对象归还对象池复用
+        entry.release()
 
     def _is_condition_met(self, entry: WaiterEntry) -> bool:
         """检查等待者是否满足唤醒条件（子类实现）"""
@@ -2506,25 +2576,24 @@ class SelectiveLockBase(BaseAsyncLock):
             await self._event.wait()
             return
 
-        # 1. 创建等待条目（初始不带 Future，尽量延迟创建）
-        entry = WaiterEntry(frozenset(target_set), None, count)
+        # 1. 从对象池中租借条目（初始不带 Future）
+        entry = WaiterEntry.acquire(frozenset(target_set), None, count)
 
-        # 2. 初始检查：如果当前已满足阈值，则无需挂起，直接返回
+        # 2. 初始检查
         if self._is_condition_met(entry):
+            # 没用到索引和 Future，直接归还
+            entry.release()
             return
 
-        # 3. 补票：创建 Future 并关联到 entry
-        entry.fut = get_running_loop().create_future()
-
-        # 4. 注册索引（仅在确定需要挂起时执行）
+        # 3. 补票：从事件循环的对象池中借取一个 Future
+        fut = entry.fut = self._loop.acquire_future()
         self._waiters_all.add(entry)
         for tid in entry.target_ids:
             self._waiters.setdefault(tid, set()).add(entry)
 
         try:
-            await entry.fut
+            await fut
         finally:
-            # 无论是因为成功被唤醒还是因为超时/取消，都要确保清理索引
             self._remove_waiter(entry)
 
     async def _on_force(self, target_set: set[int]) -> None:
