@@ -46,6 +46,7 @@ from typing import (
     Generic,
     Literal,
     AsyncGenerator,
+    overload,
 )
 
 __all__ = (
@@ -88,6 +89,49 @@ __all__ = (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class PooledMeta(type):
+    """
+    元类：管理类的实例创建，支持透明的对象池复用。
+    """
+
+    def __init__(cls, name, bases, attrs):
+        super().__init__(name, bases, attrs)
+        # 只有声明了 __pooled__ = True 的类才会创建独立的池子
+        if attrs.get("__pooled__", False):
+            cls._pool = deque(
+                maxlen=attrs.get("__pool_size__", 2048)
+            )
+
+    def __call__(cls, *args, **kwargs):
+        # 拦截 类名(...) 调用逻辑
+        if getattr(cls, "__pooled__", False) and cls._pool:
+            obj = cls._pool.popleft()
+            # 重新调用 __init__ 进行状态重置
+            obj.__init__(*args, **kwargs)
+            return obj
+        # 正常创建新对象
+        return super().__call__(*args, **kwargs)
+
+
+class Pooled(metaclass=PooledMeta):
+    """池化基类，提供统一的回收接口"""
+
+    __pooled__ = False
+
+    def release(self):
+        """归还当前实例到池中"""
+        if getattr(self, "__pooled__", False):
+            self._pool.append(self)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.release()
+
+
 _T = TypeVar("_T")
 # 使用 ContextVar 存储当前事件循环（线程安全、协程安全）
 _loop_var: ContextVar[Optional["EventLoop"]] = ContextVar("_loop", default=None)
@@ -191,23 +235,13 @@ def yield_control() -> YieldControl:
     return YieldControl()
 
 
-class Future(Generic[_T]):
+class Future(Pooled, Generic[_T]):
     """
     异步操作的结果占位符
-
-    Future 代表一个尚未完成的异步操作的结果。
-    可以设置结果、异常，或取消操作。
-
-    Attributes:
-        _result: 操作结果
-        _exception: 操作异常
-        _done: 是否已完成
-        _cancelled: 是否被取消
-        _cancel_msg: 取消消息
-        _callbacks: 完成回调列表
-        _loop: 关联的事件循环
     """
 
+    __pooled__ = True
+    __pool_size__ = 2048
     __slots__ = (
         "_result",
         "_exception",
@@ -219,33 +253,22 @@ class Future(Generic[_T]):
     )
 
     def __init__(self, loop: Optional["EventLoop"] = None) -> None:
-        """
-        初始化 Future
-
-        Args:
-            loop: 关联的事件循环（默认为当前运行的循环）
-        """
+        """初始化 Future"""
+        self._loop = loop or get_running_loop()
         self._result = None
         self._exception = None
         self._done = False
         self._cancelled = False
         self._cancel_msg = None
-        self._callbacks: List[Callable[["Future"], Any]] = []
-        self._loop = loop or get_running_loop()
+        self._callbacks = []
 
     def reset(self, loop: "EventLoop") -> None:
-        """
-        重置 Future 状态以便对象池复用
-        Notes:
-            重置应发生于每次 Future 重用前。
-        """
-        self._loop = loop
-        self._result = None
-        self._exception = None
-        self._done = False
-        self._cancelled = False
-        self._cancel_msg = None
-        self._callbacks.clear()
+        """兼容旧逻辑的重置方法"""
+        self.__init__(loop)
+
+    def release(self):
+        if self.cancelled() or not self.done():
+            super().release()
 
     def _check_done(self, check_true: bool = True) -> None:
         """
@@ -437,10 +460,10 @@ class Task(Future[_T]):
     )
 
     def __init__(
-        self,
-        gen: Union[Awaitable[Any], Generator[Any, Any, Any]],
-        loop: Optional["EventLoop"] = None,
-        name: Optional[str] = None,
+            self,
+            gen: Union[Awaitable[Any], Generator[Any, Any, Any]],
+            loop: Optional["EventLoop"] = None,
+            name: Optional[str] = None,
     ) -> None:
         """
         初始化 Task
@@ -643,44 +666,27 @@ class Task(Future[_T]):
             self._loop.call_soon(self._step)
 
 
-class TimerHandle:
+class TimerHandle(Pooled):
     """
     定时器句柄，代表一个已排期的延迟回调
-
-    TimerHandle 由 EventLoop.call_later() 创建，
-    允许用户取消尚未执行的定时器。
-
-    Attributes:
-        _callback: 到期时执行的回调函数
-        _args: 回调函数的参数
-        _loop_ref: 事件循环的弱引用（避免循环引用）
-        _when: 定时器的到期时间（单调时间）
-        _cancelled: 是否已被取消
     """
 
+    __pooled__ = True
+    __pool_size__ = 2048
     __slots__ = ("_callback", "_args", "_loop_ref", "_when", "_cancelled")
 
     def __init__(
-        self,
-        callback: Callable[..., Any],
-        args: Tuple[Any, ...],
-        loop: "EventLoop",
-        when: float,
+            self,
+            callback: Callable[..., Any],
+            args: Tuple[Any, ...],
+            loop: "EventLoop",
+            when: float,
     ) -> None:
-        """
-        初始化定时器句柄
-
-        Args:
-            callback: 到期时执行的回调函数
-            args: 回调函数的参数元组
-            loop: 关联的事件循环
-            when: 到期时间（单调时间戳）
-        """
+        """初始化定时器句柄"""
         self._callback = callback
         self._args = args
-        self._loop_ref = weakref.ref(loop)  # 弱引用
-
-        self._when = when  # 记录到期时间，便于调试
+        self._loop_ref = weakref.ref(loop)
+        self._when = when
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -778,7 +784,6 @@ class EventLoop:
         self._execute_pool: Optional[ThreadPoolExecutor] = None
         self._ready_lock = threading.Lock()  # 保护 _ready 的线程锁
         self._closed = False  # 标记是否已关闭
-        self._future_pool: deque[Future] = deque(maxlen=2048)  # 信号 Future 对象池
         self._thread_wakeup_poll_interval = (
             0.01  # self-pipe 被限制时的跨线程唤醒兜底轮询间隔
         )
@@ -833,7 +838,6 @@ class EventLoop:
         self._selector.close()
 
         # 清理对象池，打断循环引用
-        self._future_pool.clear()
 
         # 关闭线程池
         if self._execute_pool is not None:
@@ -889,7 +893,7 @@ class EventLoop:
             pass  # 写端已关闭等异常忽略
 
     def run_in_thread_executor(
-        self, func: Callable[..., Any], *args: Any, **kwargs: Any
+            self, func: Callable[..., Any], *args: Any, **kwargs: Any
     ) -> Future:
         """
         在线程池中异步执行同步函数，返回 Future
@@ -939,7 +943,7 @@ class EventLoop:
         return f
 
     def set_exception_handler(
-        self, handler: Optional[Callable[["EventLoop", dict], None]]
+            self, handler: Optional[Callable[["EventLoop", dict], None]]
     ) -> None:
         """
         设置自定义异常处理器
@@ -996,7 +1000,7 @@ class EventLoop:
         self._ready.append((callback, args))
 
     def call_later(
-        self, delay: float, callback: Callable[..., Any], *args: Any
+            self, delay: float, callback: Callable[..., Any], *args: Any
     ) -> TimerHandle:
         """
         延迟执行回调
@@ -1024,11 +1028,11 @@ class EventLoop:
         return handler
 
     def add_reader(
-        self,
-        fileobj: int | socket.socket,
-        callback: Callable[..., Any],
-        *args: Any,
-        one_shot: bool = False,
+            self,
+            fileobj: int | socket.socket,
+            callback: Callable[..., Any],
+            *args: Any,
+            one_shot: bool = False,
     ) -> None:
         """
         注册文件描述符的可读事件
@@ -1042,11 +1046,11 @@ class EventLoop:
         self._add_io_callback("read", fileobj, callback, args, one_shot)
 
     def add_writer(
-        self,
-        fileobj: int | socket.socket,
-        callback: Callable[..., Any],
-        *args: Any,
-        one_shot: bool = False,
+            self,
+            fileobj: int | socket.socket,
+            callback: Callable[..., Any],
+            *args: Any,
+            one_shot: bool = False,
     ) -> None:
         """
         注册文件描述符的可写事件
@@ -1082,12 +1086,12 @@ class EventLoop:
         return fileobj if isinstance(fileobj, int) else fileobj.fileno()
 
     def _add_io_callback(
-        self,
-        direction: str,
-        fileobj: int | socket.socket,
-        callback: Callable[..., Any],
-        args: Tuple[Any, ...],
-        one_shot: bool,
+            self,
+            direction: str,
+            fileobj: int | socket.socket,
+            callback: Callable[..., Any],
+            args: Tuple[Any, ...],
+            one_shot: bool,
     ) -> None:
         """内部：向 selector 的 direction 列表添加回调并更新注册。"""
         fd = self._fd(fileobj)
@@ -1141,7 +1145,7 @@ class EventLoop:
                 pass
 
     def _remove_io_callbacks(
-        self, direction: str, fileobj: int | socket.socket
+            self, direction: str, fileobj: int | socket.socket
     ) -> None:
         """内部：清空 direction 的回调并根据剩余回调修改或注销 selector 注册。"""
         fd = self._fd(fileobj)
@@ -1154,7 +1158,7 @@ class EventLoop:
         self._update_selector_registration(fd, data)
 
     def _remove_specific_io_callback(
-        self, direction: str, fileobj: int | socket.socket, callback: Callable[..., Any]
+            self, direction: str, fileobj: int | socket.socket, callback: Callable[..., Any]
     ) -> None:
         """内部：从 direction 列表中移除指定回调（按函数对象匹配）。"""
         fd = self._fd(fileobj)
@@ -1169,11 +1173,11 @@ class EventLoop:
         self._update_selector_registration(fd, data)
 
     def add_reader_threadsafe(
-        self,
-        fileobj: int | socket.socket,
-        callback: Callable[..., Any],
-        *args: Any,
-        one_shot: bool = False,
+            self,
+            fileobj: int | socket.socket,
+            callback: Callable[..., Any],
+            *args: Any,
+            one_shot: bool = False,
     ) -> None:
         """线程安全地注册可读回调（可从其他线程调用）。"""
         # 使用 call_soon_threadsafe 在事件循环线程中执行实际注册
@@ -1182,11 +1186,11 @@ class EventLoop:
         )
 
     def add_writer_threadsafe(
-        self,
-        fileobj: int | socket.socket,
-        callback: Callable[..., Any],
-        *args: Any,
-        one_shot: bool = False,
+            self,
+            fileobj: int | socket.socket,
+            callback: Callable[..., Any],
+            *args: Any,
+            one_shot: bool = False,
     ) -> None:
         """线程安全地注册可写回调（可从其他线程调用）。"""
         self.call_soon_threadsafe(
@@ -1194,13 +1198,13 @@ class EventLoop:
         )
 
     def remove_reader_callback(
-        self, fileobj: int | socket.socket, callback: Callable[..., Any]
+            self, fileobj: int | socket.socket, callback: Callable[..., Any]
     ) -> None:
         """从 `fileobj` 的可读回调列表中移除指定回调（非线程安全）。"""
         self._remove_specific_io_callback("read", fileobj, callback)
 
     def remove_reader_callback_threadsafe(
-        self, fileobj: int, callback: Callable[..., Any]
+            self, fileobj: int, callback: Callable[..., Any]
     ) -> None:
         """线程安全地从 `fileobj` 的可读回调列表中移除指定回调。"""
         self.call_soon_threadsafe(
@@ -1208,13 +1212,13 @@ class EventLoop:
         )
 
     def remove_writer_callback(
-        self, fileobj: int | socket.socket, callback: Callable[..., Any]
+            self, fileobj: int | socket.socket, callback: Callable[..., Any]
     ) -> None:
         """从 `fileobj` 的可写回调列表中移除指定回调（非线程安全）。"""
         self._remove_specific_io_callback("write", fileobj, callback)
 
     def remove_writer_callback_threadsafe(
-        self, fileobj: int, callback: Callable[..., Any]
+            self, fileobj: int, callback: Callable[..., Any]
     ) -> None:
         """线程安全地从 `fileobj` 的可写回调列表中移除指定回调。"""
         self.call_soon_threadsafe(
@@ -1222,9 +1226,9 @@ class EventLoop:
         )
 
     def create_task(
-        self,
-        gen: Union[Generator[Future[_T], Any, Any], Awaitable[_T]],
-        name: Optional[str] = None,
+            self,
+            gen: Union[Generator[Future[_T], Any, Any], Awaitable[_T]],
+            name: Optional[str] = None,
     ) -> Task[_T]:
         """
         创建异步任务
@@ -1246,17 +1250,12 @@ class EventLoop:
         """
         task = Task(gen, self, name=name)
         self._tasks.add(task)
-        task.add_done_callback(self._task_done)  # noqa
+        task.add_done_callback(self._on_task_done)  # noqa
         return task
 
-    def _task_done(self, task: Task) -> None:
+    def _on_task_done(self, task: "Task"):
         """
-        任务完成时的回调
-
-        从任务集合中移除已完成的任务。
-
-        Args:
-            task: 已完成的任务
+        任务完成后的内部处理：从活跃任务集合中移除。
         """
         self._tasks.discard(task)
 
@@ -1270,7 +1269,7 @@ class EventLoop:
         return Future(self)
 
     def gather(
-        self, *coro_s: Union[Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T]]
+            self, *coro_s: Union[Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T]]
     ) -> Future[_T]:
         """
         便捷方法：调用模块级 `gather`。
@@ -1278,10 +1277,10 @@ class EventLoop:
         return gather(*coro_s)
 
     def wait(
-        self,
-        fs: List[Union[Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T]]],
-        timeout_delay: Optional[float] = None,
-        return_when: _return_when = ALL_COMPLETED,
+            self,
+            fs: List[Union[Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T]]],
+            timeout_delay: Optional[float] = None,
+            return_when: _return_when = ALL_COMPLETED,
     ) -> Future[_T]:
         """
         便捷方法：调用模块级 `wait`。
@@ -1289,9 +1288,9 @@ class EventLoop:
         return wait(fs, timeout_delay=timeout_delay, return_when=return_when)
 
     def wait_for(
-        self,
-        aw: Union[Awaitable[_T], Generator[Future[_T], Any, Any]],
-        timeout_delay: float,
+            self,
+            aw: Union[Awaitable[_T], Generator[Future[_T], Any, Any]],
+            timeout_delay: float,
     ) -> Future[_T]:
         """
         便捷方法：调用模块级 `wait_for`。
@@ -1299,7 +1298,7 @@ class EventLoop:
         return wait_for(aw, timeout_delay=timeout_delay)
 
     def run(
-        self, awaitable: Union[Generator[Future[_T], Any, Any], Task[_T], Future[_T]]
+            self, awaitable: Union[Generator[Future[_T], Any, Any], Task[_T], Future[_T]]
     ) -> _T:
         """
         直接运行一个 awaitable（生成器/Task/Future）并返回最终结果。
@@ -1385,8 +1384,8 @@ class EventLoop:
         # 收集待排队的回调，稍后批量入队以减少锁争用
         to_schedule: list[tuple[Callable[..., Any], Tuple[Any, ...]]] = []
         for direction, event_flag in (
-            ("read", selectors.EVENT_READ),
-            ("write", selectors.EVENT_WRITE),
+                ("read", selectors.EVENT_READ),
+                ("write", selectors.EVENT_WRITE),
         ):
             if not (mask & event_flag):
                 continue
@@ -1474,8 +1473,10 @@ class EventLoop:
                 while self._scheduled and self._scheduled[0][0] <= now:
                     _, _, handler = heapq.heappop(self._scheduled)
                     if handler.cancelled():
+                        handler.release()
                         continue
                     handler.run()
+                    handler.release()
 
                 # 2.2 计算 Select 超时时间
                 _timeout: float | None = None
@@ -1515,25 +1516,11 @@ class EventLoop:
     def stop(self):
         self._running = False
 
-    def acquire_future(self) -> Future:
-        """从对象池中获取一个洗干净的 Future（内部使用）"""
-        if self._future_pool:
-            fut = self._future_pool.pop()
-            fut.reset(self)
-            return fut
-        return Future(self)
-
-    def release_future(self, fut: Future) -> None:
-        """将内部使用的 Future 归还到对象池"""
-        # 只有真正完成或被取消的 Future 才有资格回收，且要确保没有悬空回调
-        if fut.done() or fut.cancelled():
-            self._future_pool.append(fut)
-
     def ensure_task(
-        self,
-        task: Union[
-            Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T], Future[_T]
-        ],
+            self,
+            task: Union[
+                Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T], Future[_T]
+            ],
     ) -> Task[_T]:
         """
         确保输入被转换为 Task 对象
@@ -1570,7 +1557,7 @@ class EventLoop:
             new_task = self.create_task(wrapper())
             return new_task
         elif isinstance(task, (GeneratorType, CoroutineType)) or hasattr(
-            task, "__await__"
+                task, "__await__"
         ):
             # 协程或生成器，创建新的 Task
             return self.create_task(task)
@@ -1646,8 +1633,25 @@ def run(awaitable: Union[Awaitable[_T], Generator[Future[_T], Any, Any]]) -> _T:
         _loop_var.reset(token)  # 恢复之前的上下文
 
 
+@overload
 def gather(
-    *coro_s: Union[Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T]]
+        *coro_s: Union[Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T]],
+        return_exceptions: Literal[False] = False,
+) -> Future[List[_T]]:
+    pass
+
+
+@overload
+def gather(
+        *coro_s: Union[Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T]],
+        return_exceptions: Literal[True] = True,
+) -> Future[List[_T | Exception]]:
+    pass
+
+
+def gather(
+        *coro_s: Union[Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T]],
+        return_exceptions: bool = False,
 ) -> Future[List[_T]]:
     """
     并发运行多个协程/任务，等待它们全部完成
@@ -1658,6 +1662,8 @@ def gather(
 
     Args:
         *coro_s: 要并发执行的协程、生成器或 Task
+        return_exceptions: 如果为 True，异常将作为结果列表的一部分返回，
+                          而不是立即抛出。
 
     Returns:
         Future: 结果是按顺序排列的所有返回值列表
@@ -1682,7 +1688,7 @@ def gather(
         return all_done
 
     n = len(coro_s)
-    results = [None] * n
+    results: list[None | _T | Exception] = [None] * n
     completed = 0
     failed = False
     tasks: dict[Task, int] = {}
@@ -1696,15 +1702,20 @@ def gather(
             return
         try:
             results[idx] = t.result()
-            completed += 1
-            if completed == n:
-                all_done.set_result(results)
         except Exception as e:
-            failed = True
-            for other in tasks:
-                if not other.done():
-                    other.cancel(msg=f"Gather failed due to task {other.get_name()}")
-            all_done.set_exception(e)
+            if return_exceptions:
+                results[idx] = e
+            else:
+                failed = True
+                for other in tasks:
+                    if not other.done():
+                        other.cancel(msg="Gather failed due to task exception")
+                all_done.set_exception(e)
+                return
+
+        completed += 1
+        if completed == n:
+            all_done.set_result(results)
 
     def on_gather_cancel(f: Future):
         if f.cancelled():
@@ -1722,11 +1733,11 @@ def gather(
 
 
 def wait(
-    fs: List[
-        Union[Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T], Future[_T]]
-    ],
-    timeout_delay: Optional[float] = None,
-    return_when: _return_when = ALL_COMPLETED,
+        fs: List[
+            Union[Awaitable[_T], Generator[Future[_T], Any, Any], Task[_T], Future[_T]]
+        ],
+        timeout_delay: Optional[float] = None,
+        return_when: _return_when = ALL_COMPLETED,
 ) -> Future[Tuple[Set[Future[_T]], Set[Future[_T]]]]:
     """
     等待一组任务完成
@@ -1806,7 +1817,7 @@ def wait(
 
 
 def wait_for(
-    aw: Union[Awaitable[_T], Generator[Future[_T], Any, Any]], timeout_delay: float
+        aw: Union[Awaitable[_T], Generator[Future[_T], Any, Any]], timeout_delay: float
 ) -> Future[_T]:
     """
     等待单个异步操作完成，带超时限制
@@ -1866,7 +1877,7 @@ def wait_for(
 
 
 def create_task(
-    aw: Union[Awaitable[_T], Generator[Future[_T], Any, Any]], name: str = None
+        aw: Union[Awaitable[_T], Generator[Future[_T], Any, Any]], name: str = None
 ) -> Task[_T]:
     """
     创建一个 Task 对象
@@ -1943,105 +1954,117 @@ class AsyncSocket:
         self._sock.setblocking(False)
 
     async def connect(self, addr: tuple):
-        f = self._loop.create_future()
+        with Future(self._loop) as f:
+            try:
+                try:
+                    self._sock.connect(addr)
+                    # 连接立即成功（如本地连接）
+                    f.set_result(None)
+                    return await f
+                except (BlockingIOError, OSError) as e:
+                    # EINPROGRESS 表示连接正在进行中
+                    if e.errno not in (errno.EINPROGRESS, errno.EWOULDBLOCK):
+                        raise
 
-        try:
-            self._sock.connect(addr)
-            # 连接立即成功（如本地连接）
-            f.set_result(None)
-            return await f
-        except (BlockingIOError, OSError) as e:
-            # EINPROGRESS 表示连接正在进行中
-            if e.errno not in (errno.EINPROGRESS, errno.EWOULDBLOCK):
-                raise
+                def _on_connected():
+                    self._loop.remove_writer(self._sock.fileno())
+                    err = self._sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                    if err == 0:
+                        f.set_result(None)
+                    else:
+                        f.set_exception(socket.error(err, os.strerror(err)))
 
-        def _on_connected():
-            self._loop.remove_writer(self._sock.fileno())
-            err = self._sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
-            if err == 0:
-                f.set_result(None)
-            else:
-                f.set_exception(socket.error(err, os.strerror(err)))
-
-        # 注册可写事件（连接完成时 socket 变为可写）
-        self._loop.add_writer(self._sock.fileno(), _on_connected)
-        return await f
+                # 注册可写事件（连接完成时 socket 变为可写）
+                self._loop.add_writer(self._sock.fileno(), _on_connected)
+                return await f
+            finally:
+                self._loop.remove_writer(self._sock.fileno())
 
     async def recv(self, n_bytes: int):
-        f = self._loop.create_future()
+        with Future(self._loop) as f:
 
-        def _on_readable():
+            def _on_readable():
+                try:
+                    data = self._sock.recv(n_bytes)
+                    self._loop.remove_reader(self._sock.fileno())
+                    f.set_result(data)
+                except Exception as e:
+                    self._loop.remove_reader(self._sock.fileno())
+                    f.set_exception(e)
+
+            self._loop.add_reader(self._sock.fileno(), _on_readable)
             try:
-                data = self._sock.recv(n_bytes)
+                return await f
+            finally:
                 self._loop.remove_reader(self._sock.fileno())
-                f.set_result(data)
-            except Exception as e:
-                f.set_exception(e)
-
-        self._loop.add_reader(self._sock.fileno(), _on_readable)
-        return await f
 
     async def recv_all(self, chunk_size=4096):
         chunks = []
         while True:
-            # 这次只注册一次可读事件
-            f = self._loop.create_future()
+            with Future(self._loop) as f:
 
-            def _read_once():
+                def _read_once():
+                    try:
+                        part_data = self._sock.recv(chunk_size)
+                    except BlockingIOError:
+                        # 还未就绪，重新等待（由回调机制保证）
+                        return
+                    except Exception as e:
+                        self._loop.remove_reader(self._sock.fileno())
+                        f.set_exception(e)
+                        return
+
+                    if not part_data:
+                        # 连接关闭
+                        self._loop.remove_reader(self._sock.fileno())
+                        f.set_result(b"")
+                    else:
+                        # 有数据，尝试继续读，直到没数据为止
+                        chunks_local = [part_data]
+                        while True:
+                            try:
+                                more = self._sock.recv(chunk_size)
+                            except BlockingIOError:
+                                break
+                            except Exception as e:
+                                self._loop.remove_reader(self._sock.fileno())
+                                f.set_exception(e)
+                                return
+                            if not more:
+                                self._loop.remove_reader(self._sock.fileno())
+                                f.set_result(b"".join(chunks_local))
+                                return
+                            chunks_local.append(more)
+                        self._loop.remove_reader(self._sock.fileno())
+                        f.set_result(b"".join(chunks_local))
+
+                self._loop.add_reader(self._sock.fileno(), _read_once)
                 try:
-                    part_data = self._sock.recv(chunk_size)
-                except BlockingIOError:
-                    # 还未就绪，重新等待（由回调机制保证）
-                    return
-                except Exception as e:
+                    data = await f
+                finally:
                     self._loop.remove_reader(self._sock.fileno())
-                    f.set_exception(e)
-                    return
-
-                if not part_data:
-                    # 连接关闭
-                    self._loop.remove_reader(self._sock.fileno())
-                    f.set_result(b"")
-                else:
-                    # 有数据，尝试继续读，直到没数据为止
-                    chunks_local = [part_data]
-                    while True:
-                        try:
-                            more = self._sock.recv(chunk_size)
-                        except BlockingIOError:
-                            break
-                        except Exception as e:
-                            self._loop.remove_reader(self._sock.fileno())
-                            f.set_exception(e)
-                            return
-                        if not more:
-                            self._loop.remove_reader(self._sock.fileno())
-                            f.set_result(b"".join(chunks_local))
-                            return
-                        chunks_local.append(more)
-                    self._loop.remove_reader(self._sock.fileno())
-                    f.set_result(b"".join(chunks_local))
-
-            self._loop.add_reader(self._sock.fileno(), _read_once)
-            data = await f
             if not data:
                 break
             chunks.append(data)
         return b"".join(chunks)
 
     async def sendall(self, data: bytes):
-        f = self._loop.create_future()
+        with Future(self._loop) as f:
 
-        def _on_writable():
+            def _on_writable():
+                try:
+                    self._sock.sendall(data)
+                    self._loop.remove_writer(self._sock.fileno())
+                    f.set_result(None)
+                except Exception as e:
+                    self._loop.remove_writer(self._sock.fileno())
+                    f.set_exception(e)
+
+            self._loop.add_writer(self._sock.fileno(), _on_writable)
             try:
-                self._sock.sendall(data)
+                return await f
+            finally:
                 self._loop.remove_writer(self._sock.fileno())
-                f.set_result(None)
-            except Exception as e:
-                f.set_exception(e)
-
-        self._loop.add_writer(self._sock.fileno(), _on_writable)
-        return await f
 
     def close(self):
         self._sock.close()
@@ -2073,6 +2096,8 @@ class Event:
     实现采用多 Future 模式，支持任务取消且互不干扰。
     """
 
+    __slots__ = ("_loop", "_waiters", "_is_set")
+
     def __init__(self) -> None:
         """初始化事件，默认为未设置状态"""
         self._loop = get_running_loop()
@@ -2103,16 +2128,16 @@ class Event:
         """
         if self.is_set():
             return True
-        f = self._loop.create_future()
-        self._waiters.append(f)
-        try:
-            await f
-            return True
-        finally:
+        with Future(self._loop) as f:
+            self._waiters.append(f)
             try:
-                self._waiters.remove(f)
-            except ValueError:
-                pass
+                await f
+                return True
+            finally:
+                try:
+                    self._waiters.remove(f)
+                except ValueError:
+                    pass
 
     def clear(self) -> None:
         """重置事件为未设置状态，之后调用 wait() 的协程将会阻塞"""
@@ -2286,6 +2311,15 @@ class AsyncQueue(Generic[_T]):
         _maxsize: 队列最大容量，0 表示无限
     """
 
+    __slots__ = (
+        "_loop",
+        "_items",
+        "_getters",
+        "_putters",
+        "_maxsize",
+        "_unfinished_tasks",
+    )
+
     def __init__(self, maxsize: int = 0) -> None:
         """
         初始化异步队列
@@ -2341,10 +2375,17 @@ class AsyncQueue(Generic[_T]):
             self._items.append(item)
             self._unfinished_tasks.acquire()
             return
-        fut = self._loop.create_future()
-        self._putters.append((item, fut))
-        await fut
-        self._unfinished_tasks.acquire()
+        with Future(self._loop) as fut:
+            entry = (item, fut)
+            self._putters.append(entry)
+            try:
+                await fut
+                self._unfinished_tasks.acquire()
+            finally:
+                try:
+                    self._putters.remove(entry)
+                except ValueError:
+                    pass
 
     def put_nowait(self, item: _T) -> None:
         """
@@ -2379,9 +2420,15 @@ class AsyncQueue(Generic[_T]):
             item = self._items.popleft()
             self._wake_putter()
             return item
-        fut = self._loop.create_future()
-        self._getters.append(fut)
-        return await fut
+        with Future(self._loop) as fut:
+            self._getters.append(fut)
+            try:
+                return await fut
+            finally:
+                try:
+                    self._getters.remove(fut)
+                except ValueError:
+                    pass
 
     def get_nowait(self) -> _T:
         """
@@ -2431,49 +2478,33 @@ class AsyncQueue(Generic[_T]):
             break
 
 
-class WaiterEntry:
+class WaiterEntry(Pooled):
     """
-    就绪等待者条目，采用对象池技术减少频繁分配开销。
+    就绪等待者条目
     """
 
+    __pooled__ = True
+    __pool_size__ = 2000
     __slots__ = ("target_ids", "fut", "count")
-    _pool: deque["WaiterEntry"] = deque(maxlen=1024)
 
     def __init__(
-        self,
-        target_ids: Optional[frozenset] = None,
-        fut: Optional[Future[None]] = None,
-        count: Optional[int] = None,
+            self,
+            target_ids: Optional[frozenset[int]] = None,
+            fut: Optional[Future[None]] = None,
+            count: Optional[int] = None,
     ):
-        self.target_ids: Optional[frozenset[int]] = target_ids
-        self.fut: Optional[Future[None]] = fut
-        self.count: int = (
+        self.target_ids = target_ids
+        self.fut = fut
+        self.count = (
             count if count is not None else (len(target_ids) if target_ids else 0)
         )
-
-    @classmethod
-    def acquire(
-        cls,
-        target_ids: frozenset,
-        fut: Optional[Future[None]],
-        count: Optional[int] = None,
-    ) -> "WaiterEntry":
-        """从对象池获取或创建新的等待者条目"""
-        if cls._pool:
-            entry = cls._pool.pop()
-            entry.target_ids = target_ids
-            entry.fut = fut
-            entry.count = count if count is not None else len(target_ids)
-            return entry
-        return cls(target_ids, fut, count)
 
     def release(self) -> None:
         """重置状态并归还到对象池"""
         self.target_ids = None
         self.fut = None
         self.count = 0
-        # deque(maxlen=...) 会自动处理容量，这里直接 append
-        self.__class__._pool.append(self)
+        super().release()
 
     @classmethod
     def clear_pool(cls) -> None:
@@ -2525,10 +2556,6 @@ class SelectiveLockBase(BaseAsyncLock):
                 if not s:
                     del self._waiters[tid]
 
-        # ✅ 回收关联的信号 Future (如果有)
-        if entry.fut:
-            self._loop.release_future(entry.fut)
-
         # ✅ 将对象归还对象池复用
         entry.release()
 
@@ -2569,15 +2596,15 @@ class SelectiveLockBase(BaseAsyncLock):
             self._try_wake_waiter(entry)
 
     async def _wait_for_ids(
-        self, target_set: set[int], count: Optional[int] = None
+            self, target_set: set[int], count: Optional[int] = None
     ) -> None:
         """核心挂起逻辑：将协程加入等待队列并阻塞"""
         if not target_set:
             await self._event.wait()
             return
 
-        # 1. 从对象池中租借条目（初始不带 Future）
-        entry = WaiterEntry.acquire(frozenset(target_set), None, count)
+        # 1. 从对象池中租借条目
+        entry = WaiterEntry(frozenset(target_set), None, count)
 
         # 2. 初始检查
         if self._is_condition_met(entry):
@@ -2585,26 +2612,27 @@ class SelectiveLockBase(BaseAsyncLock):
             entry.release()
             return
 
-        # 3. 补票：从事件循环的对象池中借取一个 Future
-        fut = entry.fut = self._loop.acquire_future()
-        self._waiters_all.add(entry)
-        for tid in entry.target_ids:
-            self._waiters.setdefault(tid, set()).add(entry)
+        # 3. 直接通过 with Future 开启零分配管理
+        with Future(self._loop) as fut:
+            entry.fut = fut
+            self._waiters_all.add(entry)
+            for tid in entry.target_ids:
+                self._waiters.setdefault(tid, set()).add(entry)
 
-        try:
-            await fut
-        finally:
-            self._remove_waiter(entry)
+            try:
+                await fut
+            finally:
+                self._remove_waiter(entry)
 
     async def _on_force(self, target_set: set[int]) -> None:
         """超时强制清理钩子（子类实现）"""
         raise NotImplementedError
 
     async def wait_unlock(
-        self,
-        target_ids: Union[list[int], set[int], None] = None,
-        duration: Optional[float] = None,
-        force: bool = False,
+            self,
+            target_ids: Union[list[int], set[int], None] = None,
+            duration: Optional[float] = None,
+            force: bool = False,
     ) -> None:
         """
         等待解锁。支持局部等待（指定 ID）或全局等待（target_ids=None）。
@@ -2617,11 +2645,11 @@ class SelectiveLockBase(BaseAsyncLock):
         await self.wait_count(target_ids, count=None, duration=duration, force=force)
 
     async def wait_count(
-        self,
-        target_ids: Union[list[int], set[int], None],
-        count: Optional[int] = None,
-        duration: Optional[float] = None,
-        force: bool = False,
+            self,
+            target_ids: Union[list[int], set[int], None],
+            count: Optional[int] = None,
+            duration: Optional[float] = None,
+            force: bool = False,
     ) -> set[int]:
         """
         等待 target_ids 中的至少 count 个 ID 处于解锁状态。
@@ -2827,7 +2855,7 @@ class AsyncSelectiveLock(SelectiveLockBase):
         return set(self._active_ids)
 
     def locked_ids(
-        self, target_ids: Union[list[int], set[int], frozenset[int]]
+            self, target_ids: Union[list[int], set[int], frozenset[int]]
     ) -> set[int]:
         """
         查询指定的多个 ID 是否还在锁定状态。
@@ -2856,7 +2884,7 @@ class AsyncSemaphore:
     - release(): 增加计数，并唤醒等待者。
     """
 
-    __slots__ = ("_value", "_waiters")
+    __slots__ = ("_value", "_waiters", "_loop")
 
     def __init__(self, value: int = 1):
         """
@@ -2867,6 +2895,7 @@ class AsyncSemaphore:
             raise ValueError("Semaphore initial value must be >= 0")
         self._value = value
         self._waiters: deque[Future[None]] = deque()
+        self._loop = get_running_loop()
 
     def locked(self) -> bool:
         """若没有余量，则返回 True"""
@@ -2879,15 +2908,16 @@ class AsyncSemaphore:
         如果计数器为 0，则挂起直到被 release 唤醒。
         """
         if self._value <= 0:
-            fut = get_running_loop().create_future()
-            self._waiters.append(fut)
-            try:
-                await fut
-                return True
-            except FutureCancelledError:
-                if not fut.done() and fut in self._waiters:
-                    self._waiters.remove(fut)
-                raise
+            with Future(self._loop) as fut:
+                self._waiters.append(fut)
+                try:
+                    await fut
+                    return True
+                finally:
+                    try:
+                        self._waiters.remove(fut)
+                    except ValueError:
+                        pass
 
         self._value -= 1
         return True
@@ -2930,10 +2960,10 @@ class AsyncLock(AsyncSemaphore):
 
 
 async def stream_from_queue_sentinel(
-    queue: AsyncQueue[_T],
-    end_signal: Union[Task, Event],
-    filter_func: Optional[Callable[[_T], bool]] = None,
-    name: str = "StreamPump",
+        queue: AsyncQueue[_T],
+        end_signal: Union[Task, Event],
+        filter_func: Optional[Callable[[_T], bool]] = None,
+        name: str = "StreamPump",
 ) -> AsyncGenerator[_T, None]:
     """
     通用异步流式泵：从异步队列中流式获取数据，直到接收到结束信号或哨兵(哨兵模式)。
