@@ -5,7 +5,7 @@
 """
 
 
-from simple_asyncio import run, sleep, get_event_loop, yield_control
+from simple_asyncio import run, sleep, get_event_loop, yield_control, gather
 
 
 def cpu_heavy_task(task_id, iterations=100000):
@@ -60,7 +60,7 @@ async def test_cooperative_multitasking():
     print("\n所有任务已启动，观察交错执行...\n")
 
     # 等待所有任务完成
-    results = await loop.gather(sync_task1, sync_task2, async_task1, async_task2)
+    results = await gather(sync_task1, sync_task2, async_task1, async_task2)
 
     print("\n" + "=" * 70)
     print("所有任务完成！")
